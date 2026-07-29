@@ -112,9 +112,29 @@ def _pdf_extract_tables_text(page) -> str:
     return "\n".join(partes)
 
 
+_PYMUPDF_SILENCED = False
+
+
+def _silenciar_pymupdf_warnings():
+    """Los errores de MuPDF (xref, object out of range) son warnings de PDFs mal
+    formados que igual se leen. En una corrida grande son puro ruido en consola.
+    """
+    global _PYMUPDF_SILENCED
+    if _PYMUPDF_SILENCED:
+        return
+    import pymupdf
+    try:
+        pymupdf.TOOLS.mupdf_display_errors(False)
+        pymupdf.TOOLS.mupdf_display_warnings(False)
+    except Exception:
+        pass
+    _PYMUPDF_SILENCED = True
+
+
 def extract_pdf(path: Path) -> list[tuple[int, str]]:
     import pymupdf  # ponytail: import lazy
 
+    _silenciar_pymupdf_warnings()
     out = []
     with pymupdf.open(str(path)) as doc:
         for i, page in enumerate(doc, start=1):
