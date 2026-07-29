@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import logging
 import os
 import re
@@ -28,7 +29,17 @@ _MAX_DOC_SIZE = int(os.getenv("DOC_MAX_SIZE_BYTES", str(20 * 1024 * 1024)))
 # Limite de chars del texto extraido que se inyecta al agente. gpt-5 tiene mucho
 # contexto pero cada token cuesta; 100k chars ~= 25k tokens ~= mayoria de escritos.
 _DOC_MAX_CHARS = int(os.getenv("DOC_MAX_CHARS", "100000"))
-_FMT_SOPORTADOS = {".pdf", ".docx", ".doc", ".txt"}
+_FMT_TEXTO = {".pdf", ".docx", ".doc", ".txt"}
+_FMT_IMAGEN = {".jpg", ".jpeg", ".png", ".webp"}
+_FMT_SOPORTADOS = _FMT_TEXTO | _FMT_IMAGEN
+# Telegram fotos pueden pesar hasta 10MB; documentos hasta 20MB (bot API).
+_MAX_IMG_SIZE = int(os.getenv("IMG_MAX_SIZE_BYTES", str(10 * 1024 * 1024)))
+_MIME_POR_EXT = {
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".webp": "image/webp",
+}
 
 
 from rag.extractor import extraer_texto_de_archivo
@@ -87,6 +98,45 @@ async def on_voice(m: Message, bot: Bot) -> None:
     await _enviar_respuesta(m, bot, reply)
 
 
+async def _descargar_bytes(bot: Bot, file_id: str) -> bytes:
+    tg_file = await bot.get_file(file_id)
+    buf = io.BytesIO()
+    await bot.download_file(tg_file.file_path, destination=buf)
+    return buf.getvalue()
+
+
+async def _procesar_imagen(m: Message, bot: Bot, data: bytes, mime: str, source_name: str) -> None:
+    caption = (m.caption or "").strip() or (
+        "Describi juridicamente esta imagen. Si es documento, transcribi todo el texto legible. "
+        "Si algo esta ilegible, decilo. No inventes."
+    )
+    prompt = f"[IMAGEN ADJUNTA: {source_name}]\n{caption}"
+    logger.info("Imagen chat=%s source=%s size=%s mime=%s",
+                m.chat.id, source_name, len(data), mime)
+    reply = await chat_with_agent(str(m.chat.id), prompt, images=[(mime, data)])
+    await _enviar_respuesta(m, bot, reply)
+
+
+@router.message(F.photo)
+async def on_photo(m: Message, bot: Bot) -> None:
+    await bot.send_chat_action(m.chat.id, ChatAction.TYPING)
+    # Telegram manda varias resoluciones; la ultima es la mejor.
+    ph = m.photo[-1]
+    if ph.file_size and ph.file_size > _MAX_IMG_SIZE:
+        await m.answer(
+            f"La foto pesa {ph.file_size / (1024*1024):.1f}MB, maximo "
+            f"{_MAX_IMG_SIZE // (1024*1024)}MB. Reduci calidad y mandala de nuevo."
+        )
+        return
+    try:
+        data = await _descargar_bytes(bot, ph.file_id)
+    except Exception as e:
+        logger.exception("Fallo descargando foto: %s", e)
+        await m.answer(f"No pude descargar la imagen: {e}")
+        return
+    await _procesar_imagen(m, bot, data, "image/jpeg", f"foto_{ph.file_unique_id}.jpg")
+
+
 @router.message(F.document)
 async def on_document(m: Message, bot: Bot) -> None:
     doc = m.document
@@ -97,9 +147,31 @@ async def on_document(m: Message, bot: Bot) -> None:
 
     if ext not in _FMT_SOPORTADOS:
         await m.answer(
-            f"Formato '{ext}' no soportado. Puedo leer PDF, DOCX, DOC y TXT."
+            f"Formato '{ext}' no soportado. Puedo leer PDF, DOCX, DOC, TXT y "
+            "imagenes JPG/PNG/WEBP."
         )
         return
+
+    # --- Imagen adjuntada como archivo ---
+    if ext in _FMT_IMAGEN:
+        if doc.file_size and doc.file_size > _MAX_IMG_SIZE:
+            mb = doc.file_size / (1024 * 1024)
+            await m.answer(
+                f"La imagen pesa {mb:.1f}MB, maximo {_MAX_IMG_SIZE // (1024*1024)}MB."
+            )
+            return
+        await bot.send_chat_action(m.chat.id, ChatAction.TYPING)
+        try:
+            data = await _descargar_bytes(bot, doc.file_id)
+        except Exception as e:
+            logger.exception("Fallo descargando imagen %s: %s", fn, e)
+            await m.answer(f"No pude descargar la imagen: {e}")
+            return
+        mime = _MIME_POR_EXT.get(ext, "image/jpeg")
+        await _procesar_imagen(m, bot, data, mime, fn)
+        return
+
+    # --- Documento de texto (PDF/DOCX/DOC/TXT) ---
     if doc.file_size and doc.file_size > _MAX_DOC_SIZE:
         mb = doc.file_size / (1024 * 1024)
         await m.answer(
@@ -122,7 +194,6 @@ async def on_document(m: Message, bot: Bot) -> None:
         return
 
     try:
-        # to_thread: la extraccion es sync y puede tardar en PDFs grandes.
         texto, n_paginas = await asyncio.to_thread(extraer_texto_de_archivo, local, ext)
     except Exception as e:
         logger.exception("Fallo extrayendo %s: %s", fn, e)
@@ -136,8 +207,9 @@ async def on_document(m: Message, bot: Bot) -> None:
 
     if not texto:
         await m.answer(
-            f"'{fn}' no tiene texto extraible. Probablemente sea un escaneo sin OCR; "
-            "necesito el archivo con capa de texto o que copies el contenido a mano."
+            f"'{fn}' no tiene texto extraible. Probablemente sea un escaneo sin OCR. "
+            "Podes mandarlo como IMAGEN (foto o adjunto .jpg/.png) para que lo lea con vision, "
+            "o exportarlo con capa de texto."
         )
         return
 
@@ -169,6 +241,6 @@ async def on_document(m: Message, bot: Bot) -> None:
 @router.message()
 async def on_other(m: Message) -> None:
     await m.answer(
-        "Puedo procesar: texto, audio y archivos PDF/DOCX/DOC/TXT. "
-        "Mandame tu consulta o adjuntame el archivo."
+        "Puedo procesar: texto, audio, imagenes (JPG/PNG/WEBP) y archivos "
+        "PDF/DOCX/DOC/TXT. Mandame tu consulta o adjuntame lo que necesites."
     )

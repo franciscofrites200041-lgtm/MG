@@ -82,6 +82,30 @@ def test_agent_detecta_reasoning_models():
     assert not _is_reasoning_model("gpt-4.1")
 
 
+def test_agent_construye_content_multimodal_con_imagenes():
+    os.environ.setdefault("OPENAI_API_KEY", "dummy")
+    from agent import _build_user_content
+
+    # Sin imagenes: content es string simple
+    r = _build_user_content("hola", None)
+    assert r == "hola"
+    r = _build_user_content("hola", [])
+    assert r == "hola"
+
+    # Con 1 imagen: lista con text + image_url data URL
+    r = _build_user_content("que ves?", [("image/jpeg", b"\xff\xd8fake")])
+    assert isinstance(r, list) and len(r) == 2
+    assert r[0] == {"type": "text", "text": "que ves?"}
+    assert r[1]["type"] == "image_url"
+    assert r[1]["image_url"]["url"].startswith("data:image/jpeg;base64,")
+
+    # Con 2 imagenes: 3 partes (text + 2 img)
+    r = _build_user_content("compara", [("image/png", b"a"), ("image/jpeg", b"b")])
+    assert len(r) == 3
+    assert r[1]["image_url"]["url"].startswith("data:image/png;base64,")
+    assert r[2]["image_url"]["url"].startswith("data:image/jpeg;base64,")
+
+
 def test_agent_tool_schemas_matchean_tool_map():
     os.environ.setdefault("OPENAI_API_KEY", "dummy")
     from agent import TOOL_MAP, TOOL_SCHEMAS
@@ -319,6 +343,7 @@ def main():
         test_sanitize_query_saca_puntuacion,
         test_elegir_modelo_rutea_a_heavy_cuando_pide_redactar,
         test_agent_detecta_reasoning_models,
+        test_agent_construye_content_multimodal_con_imagenes,
         test_agent_tool_schemas_matchean_tool_map,
         test_gdocs_fallback_local_genera_docx,
         test_text_cleaner_saca_markdown_y_divide,

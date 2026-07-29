@@ -1,6 +1,7 @@
-"""Agente OpenAI con ruteo fast/heavy, memoria y todas las tools del estudio."""
+"""Agente OpenAI con ruteo fast/heavy, memoria, tools y vision multimodal."""
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import os
@@ -82,7 +83,17 @@ Reglas para archivos adjuntos:
 - Si el usuario adjunta un archivo sin pregunta clara ("Analiza este archivo"), hace un resumen ejecutivo: partes, objeto, fechas clave, clausulas relevantes desde punto de vista de defensa de aseguradora. Al final, pregunta que necesita puntualmente.
 - Si el archivo esta vacio o no se extrajo texto, el bot ya avisa al usuario; no lo veras en tu mensaje.
 
-E. Redaccion de Escritos (generar_escrito):
+E. IMAGENES ADJUNTAS (VISION):
+El usuario puede mandarte fotos o imagenes directamente en el chat (fotos de cedulas, sellos, choques, DNI, capturas de pantalla). Las ves con vision nativa del modelo, sin OCR intermedio.
+
+Reglas para imagenes:
+- Describi con precision juridica: si es cedula de notificacion -> emisor, destinatario, fecha, causa, N° expediente. Si es foto de choque -> daños visibles, patentes si se leen. Si es documento fotografiado -> transcribi el texto legible palabra por palabra.
+- Si un sello, firma, texto o parte es ilegible: DECILO, no adivines.
+- Si la imagen es una foto de un documento parcial (se ve solo media hoja), avisa que solo tenes esa vista y ofrecele al usuario que mande el resto.
+- Si la imagen no tiene relevancia juridica clara (foto de comida, meme), respondele cortesmente que necesitas contexto legal.
+- Prohibido inventar contenido de una imagen que no se ve claro. Prohibido asumir que "seguramente dice X" cuando el texto no es legible.
+
+F. Redaccion de Escritos (generar_escrito):
 Cuando ya tenes toda la informacion necesaria y el usuario pidio explicitamente un documento escrito (contestacion, demanda, carta documento), llama a generar_escrito(titulo, cuerpo). La funcion crea un .docx real que el bot le enviara al usuario. Escribi el cuerpo completo antes de llamarla.
 
 3. PROTOCOLO DE INICIO PARA REDACCION (REGLA DE ORO)
@@ -268,13 +279,36 @@ def _normalize_role(role: str) -> str:
     return "assistant" if role in ("model", "assistant") else "user"
 
 
-async def chat_with_agent(session_id: str, user_message: str) -> str:
+def _build_user_content(text: str, images: list[tuple[str, bytes]] | None):
+    """Compone el content del message del user. Con imagenes -> content multimodal.
+
+    Args:
+        text: texto de la consulta (caption o similar).
+        images: lista de (mime_type, bytes) para adjuntar como image_url.
+    """
+    if not images:
+        return text
+    parts: list[dict] = [{"type": "text", "text": text}]
+    for mime, data in images:
+        b64 = base64.b64encode(data).decode("ascii")
+        parts.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:{mime};base64,{b64}"},
+        })
+    return parts
+
+
+async def chat_with_agent(
+    session_id: str,
+    user_message: str,
+    images: list[tuple[str, bytes]] | None = None,
+) -> str:
     raw_history = await get_history(session_id)
 
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     for m in raw_history:
         messages.append({"role": _normalize_role(m["role"]), "content": m["content"]})
-    messages.append({"role": "user", "content": user_message})
+    messages.append({"role": "user", "content": _build_user_content(user_message, images)})
 
     model = elegir_modelo(user_message)
     logger.info("session=%s model=%s msg_len=%d", session_id, model, len(user_message))
@@ -320,7 +354,10 @@ async def chat_with_agent(session_id: str, user_message: str) -> str:
         logger.exception("Error llamando a OpenAI: %s", e)
         return f"Ocurrio un error en la IA: {e}"
 
-    raw_history.append({"role": "user", "content": user_message})
+    # ponytail: en history persistimos solo texto; las imagenes son efimeras
+    # (se ven una sola vez, no queremos base64 hinchando memory.db)
+    hist_user = user_message + (f"\n[Adjunto: {len(images)} imagen(es)]" if images else "")
+    raw_history.append({"role": "user", "content": hist_user})
     raw_history.append({"role": "assistant", "content": reply})
     if len(raw_history) > 50:
         raw_history = raw_history[-50:]

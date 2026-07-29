@@ -33,11 +33,21 @@ Esto arregla las queries semánticas ("el asegurado no avisó a tiempo") que
 FTS5 puro no encontraría, sin pagar API de embeddings ni levantar Qdrant.
 
 **Adjuntos por Telegram**: además de RAG interno, el usuario puede mandar
-PDF/DOCX/DOC/TXT directamente al chat (hasta 20MB). El bot los extrae con el
-mismo pipeline (`rag/extractor.py`), los inyecta al mensaje como
-`[ARCHIVO ADJUNTO: nombre.pdf (N paginas)]` y el agente responde con las
-mismas reglas anti-alucinación. Si el archivo supera `DOC_MAX_CHARS` (default
-100k caracteres), se trunca y se avisa al agente.
+directamente al chat:
+
+- **PDF/DOCX/DOC/TXT** (hasta 20MB): se extraen con el mismo pipeline
+  (`rag/extractor.py`) y se inyectan al mensaje como
+  `[ARCHIVO ADJUNTO: nombre.pdf (N paginas)]`. Si supera `DOC_MAX_CHARS`
+  (default 100k caracteres) se trunca y se avisa al agente.
+- **Imágenes JPG/PNG/WEBP** (hasta 10MB): fotos de cédulas, documentos
+  escaneados, choques, sellos, DNI. El modelo (`gpt-5` / `gpt-5-mini`) las lee
+  con visión nativa, sin OCR intermedio. El bot codifica en base64 y las
+  manda como `image_url` en el content multimodal. En el historial persistente
+  solo se guarda un placeholder (`[Adjunto: 1 imagen(es)]`) para no inflar
+  `memory.db` con base64.
+
+Los adjuntos combinables con RAG: el agente puede recibir una foto/PDF y a
+la vez llamar `buscar_en_documentos` para comparar contra la base interna.
 
 **Ruteo automático de modelos**: `elegir_modelo()` manda queries de búsqueda a
 `gpt-5-mini` (rápido/barato) y redacciones/análisis de sentencia a `gpt-5`
@@ -146,7 +156,7 @@ manda igual — funciona, solo pierde el template corporativo.
 python tests/test_smoke.py
 ```
 
-17/17 tests OK en <2s, sin llamadas LLM ni red. El re-ranker corre en modo mock
+18/18 tests OK en <2s, sin llamadas LLM ni red. El re-ranker corre en modo mock
 (bag-of-chars determinístico) para no bajar el modelo real en los smoke tests.
 El agente OpenAI no se golpea en tests (validado solo que los tool schemas
 coincidan con `TOOL_MAP` y que el ruteo Fast/Heavy funcione).
@@ -168,7 +178,7 @@ python -m rag.reranker
 |---|---|
 | `main.py` | Entry point aiogram. Init DBs + registra router. |
 | `agent.py` | OpenAI Chat Completions + system prompt + ruteo Fast/Heavy + tool loop + tools registry. |
-| `handlers.py` | Handlers Telegram: texto, voz (Whisper), adjuntos PDF/DOCX/DOC/TXT, envío de docs generados. |
+| `handlers.py` | Handlers Telegram: texto, voz (Whisper), adjuntos PDF/DOCX/DOC/TXT, imágenes con visión (JPG/PNG/WEBP), envío de docs generados. |
 | `rag/extractor.py` | Walk NAS + PyMuPDF (texto+tablas+orden por columnas) / python-docx (párrafos+tablas+headers+footers en orden natural) / antiword / TXT con auto-detección de encoding. Multiprocessing + FTS5 upsert + embeddings. Marca `status='sin_texto'` los PDFs sin capa de texto. |
 | `rag/reranker.py` | Modelo sentence-transformers + cosine reranking + modo mock. |
 | `rag/search.py` | Tools de búsqueda y lectura de páginas expuestos al agente. |
