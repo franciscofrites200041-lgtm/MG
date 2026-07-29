@@ -247,6 +247,30 @@ def test_extractor_txt_maneja_encoding_latin1():
         assert "viejo" in r, r
 
 
+def test_extractor_excluye_directorios_synology_y_lockfiles_office():
+    """El walker debe saltar #recycle, #snapshot, @eaDir y archivos ~$ (lockfiles Word)."""
+    _reset_reranker()
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        # Archivos buenos
+        (root / "bueno1.txt").write_text("contenido valido", encoding="utf-8")
+        (root / "carpeta_ok").mkdir()
+        (root / "carpeta_ok" / "bueno2.txt").write_text("otro contenido", encoding="utf-8")
+        # Basura a excluir
+        (root / "#recycle").mkdir()
+        (root / "#recycle" / "basura.txt").write_text("no debe indexarse", encoding="utf-8")
+        (root / "@eaDir").mkdir()
+        (root / "@eaDir" / "meta.txt").write_text("meta synology", encoding="utf-8")
+        (root / "~$lockfile.docx").write_text("lockfile de word", encoding="utf-8")
+        (root / "carpeta_ok" / "~$otro.docx").write_text("otro lockfile", encoding="utf-8")
+
+        db = str(Path(d) / "idx.db")
+        stats = index_root(d, db, workers=1)
+        # Solo los 2 buenos deben haberse indexado.
+        assert stats["ok"] == 2, stats
+        assert stats["err"] == 0 and stats["sin_texto"] == 0, stats
+
+
 def test_extractor_pdf_sin_capa_de_texto_se_marca_sin_texto():
     """PDF sin capa de texto (equivalente a escaneado): status='sin_texto', no rompe."""
     _reset_reranker()
@@ -351,6 +375,7 @@ def main():
         test_reranker_reordena_semanticamente_con_mock,
         test_extractor_docx_captura_tablas_headers_y_footers,
         test_extractor_txt_maneja_encoding_latin1,
+        test_extractor_excluye_directorios_synology_y_lockfiles_office,
         test_extractor_pdf_sin_capa_de_texto_se_marca_sin_texto,
         test_handlers_extrae_texto_de_docx_adjunto,
         test_handlers_extrae_texto_de_txt_adjunto,

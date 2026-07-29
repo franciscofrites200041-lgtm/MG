@@ -31,6 +31,15 @@ logger = logging.getLogger("rag.extractor")
 SUPPORTED_EXT = {".pdf", ".docx", ".doc", ".txt"}
 WORDS_PER_CHUNK = 500
 
+# Directorios que NO deben indexarse (basura del NAS o metadata del OS).
+# #recycle y #snapshot: papelera y snapshots del Synology (0 bytes o duplicados)
+# @eaDir: metadata + thumbnails que genera DSM
+# .DS_Store, Thumbs.db: metadata de Finder/Explorer
+EXCLUDE_DIRS = {"#recycle", "#snapshot", "@eaDir", ".DS_Store", "Thumbs.db"}
+
+# Prefijos de archivos que no son contenido real (lockfiles temporales de Office).
+EXCLUDE_PREFIXES = ("~$",)
+
 SCHEMA_PATH = Path(__file__).parent / "schema.sql"
 
 
@@ -62,8 +71,12 @@ def already_indexed(conn: sqlite3.Connection, path: str, mtime: float, size: int
 
 def walk_files(root: str) -> Iterable[Path]:
     root_p = Path(root)
-    for dirpath, _, filenames in os.walk(root_p):
+    for dirpath, dirnames, filenames in os.walk(root_p):
+        # Modifica dirnames in-place para no recorrer basura.
+        dirnames[:] = [d for d in dirnames if d not in EXCLUDE_DIRS]
         for fn in filenames:
+            if fn.startswith(EXCLUDE_PREFIXES):
+                continue
             p = Path(dirpath) / fn
             if p.suffix.lower() in SUPPORTED_EXT:
                 yield p
@@ -204,21 +217,64 @@ def extract_docx(path: Path) -> list[tuple[int, str]]:
     return _chunk_by_words(texto_total)
 
 
+def _extract_doc_via_word(path: Path) -> str:
+    """Windows-only: extrae texto de un .doc usando Word via COM. Requiere pywin32 y MS Word."""
+    import pythoncom
+    from win32com import client as win32client
+
+    pythoncom.CoInitialize()
+    word = None
+    try:
+        word = win32client.DispatchEx("Word.Application")  # DispatchEx = instancia dedicada por proceso
+        word.Visible = False
+        word.DisplayAlerts = False
+        doc = word.Documents.Open(
+            str(path.resolve()),
+            ReadOnly=True,
+            AddToRecentFiles=False,
+            Visible=False,
+            ConfirmConversions=False,
+        )
+        try:
+            return doc.Content.Text or ""
+        finally:
+            doc.Close(SaveChanges=False)
+    finally:
+        if word is not None:
+            try:
+                word.Quit()
+            except Exception:
+                pass
+        pythoncom.CoUninitialize()
+
+
 def extract_doc(path: Path) -> list[tuple[int, str]]:
-    # ponytail: .doc (formato binario viejo) via antiword. Si no está, skip.
-    if not shutil.which("antiword"):
-        raise RuntimeError("antiword no instalado; .doc no procesable")
-    r = subprocess.run(
-        ["antiword", str(path)],
-        capture_output=True,
-        text=True,
-        timeout=120,
-        encoding="utf-8",
-        errors="replace",
-    )
-    if r.returncode != 0:
-        raise RuntimeError(f"antiword falló: {r.stderr[:200]}")
-    return _chunk_by_words(r.stdout)
+    """Extrae .doc con fallback multi-plataforma:
+    - Linux/Docker (NAS): antiword (rapido y liviano).
+    - Windows: Word COM via pywin32 (requiere Word instalado).
+    - Si ninguno esta: raise para que quede como status='error'.
+    """
+    if shutil.which("antiword"):
+        r = subprocess.run(
+            ["antiword", str(path)],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            encoding="utf-8",
+            errors="replace",
+        )
+        if r.returncode != 0:
+            raise RuntimeError(f"antiword fallo: {r.stderr[:200]}")
+        return _chunk_by_words(r.stdout)
+
+    if sys.platform == "win32":
+        try:
+            text = _extract_doc_via_word(path)
+        except Exception as e:
+            raise RuntimeError(f"Word COM no disponible o fallo: {e}")
+        return _chunk_by_words(text)
+
+    raise RuntimeError("Ni antiword (Linux) ni pywin32+Word (Windows) disponibles para .doc")
 
 
 def extract_txt(path: Path) -> list[tuple[int, str]]:
