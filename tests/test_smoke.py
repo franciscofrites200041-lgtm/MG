@@ -250,6 +250,50 @@ def test_extractor_pdf_sin_capa_de_texto_se_marca_sin_texto():
         conn.close()
 
 
+def test_handlers_extrae_texto_de_docx_adjunto():
+    """El helper que usa on_document debe capturar tablas, headers y footers igual que el pipeline offline."""
+    try:
+        import docx
+    except ImportError:
+        print("SKIP docx")
+        return
+    from rag.extractor import extraer_texto_de_archivo
+    with tempfile.TemporaryDirectory() as d:
+        doc = docx.Document()
+        doc.sections[0].header.paragraphs[0].text = "HEADER XYZ"
+        doc.add_paragraph("Cuerpo principal del contrato de seguro.")
+        t = doc.add_table(rows=1, cols=2)
+        t.cell(0, 0).text = "POLIZA123"
+        t.cell(0, 1).text = "PRIMA5000"
+        f = Path(d) / "contrato.docx"
+        doc.save(str(f))
+
+        texto, n = extraer_texto_de_archivo(f, ".docx")
+        assert n >= 1, n
+        assert "HEADER XYZ" in texto, texto
+        assert "Cuerpo principal" in texto, texto
+        assert "POLIZA123" in texto and "PRIMA5000" in texto, texto
+
+
+def test_handlers_extrae_texto_de_txt_adjunto():
+    from rag.extractor import extraer_texto_de_archivo
+    with tempfile.TemporaryDirectory() as d:
+        f = Path(d) / "nota.txt"
+        f.write_text("El asegurado incumplio el aviso.", encoding="utf-8")
+        texto, n = extraer_texto_de_archivo(f, ".txt")
+        assert n == 1
+        assert "aviso" in texto
+
+
+def test_handlers_extension_no_soportada_devuelve_vacio():
+    from rag.extractor import extraer_texto_de_archivo
+    with tempfile.TemporaryDirectory() as d:
+        f = Path(d) / "algo.xyz"
+        f.write_text("contenido", encoding="utf-8")
+        texto, n = extraer_texto_de_archivo(f, ".xyz")
+        assert texto == "" and n == 0
+
+
 def test_search_sin_reranker_sigue_funcionando():
     _reset_reranker()
     os.environ["USE_RERANKER"] = "0"
@@ -283,6 +327,9 @@ def main():
         test_extractor_docx_captura_tablas_headers_y_footers,
         test_extractor_txt_maneja_encoding_latin1,
         test_extractor_pdf_sin_capa_de_texto_se_marca_sin_texto,
+        test_handlers_extrae_texto_de_docx_adjunto,
+        test_handlers_extrae_texto_de_txt_adjunto,
+        test_handlers_extension_no_soportada_devuelve_vacio,
         test_search_sin_reranker_sigue_funcionando,
     ]
     fallos = 0

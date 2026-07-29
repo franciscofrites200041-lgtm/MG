@@ -243,6 +243,29 @@ EXTRACTORS = {
 }
 
 
+def extraer_texto_de_archivo(path: Path, ext: str) -> tuple[str, int]:
+    """Extrae texto de un archivo local ad-hoc (NO indexa; solo devuelve string).
+
+    Uso: adjuntos de Telegram. Reusa los mismos extractores que la corrida
+    offline, para que la calidad sea identica.
+
+    Returns:
+        (texto_concatenado_con_marcadores_[Pag N], n_paginas). Si no soportado
+        o vacio: ("", 0).
+    """
+    fn = EXTRACTORS.get(ext.lower())
+    if fn is None:
+        return "", 0
+    try:
+        chunks = fn(path)
+    except Exception:
+        return "", 0
+    if not chunks:
+        return "", 0
+    texto = "\n\n".join(f"[Pag {pg}]\n{txt}" for pg, txt in chunks)
+    return texto, len(chunks)
+
+
 def process_one(path_str: str) -> Extracted:
     p = Path(path_str)
     ext = p.suffix.lower()

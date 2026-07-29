@@ -32,6 +32,13 @@ infra de vectores, un solo archivo `.db`, corre en cualquier NAS con Docker.
 Esto arregla las queries semánticas ("el asegurado no avisó a tiempo") que
 FTS5 puro no encontraría, sin pagar API de embeddings ni levantar Qdrant.
 
+**Adjuntos por Telegram**: además de RAG interno, el usuario puede mandar
+PDF/DOCX/DOC/TXT directamente al chat (hasta 20MB). El bot los extrae con el
+mismo pipeline (`rag/extractor.py`), los inyecta al mensaje como
+`[ARCHIVO ADJUNTO: nombre.pdf (N paginas)]` y el agente responde con las
+mismas reglas anti-alucinación. Si el archivo supera `DOC_MAX_CHARS` (default
+100k caracteres), se trunca y se avisa al agente.
+
 **Ruteo automático de modelos**: `elegir_modelo()` manda queries de búsqueda a
 `gpt-5-mini` (rápido/barato) y redacciones/análisis de sentencia a `gpt-5`
 (más caro y mejor razonando). Ambos overrideables por env
@@ -139,7 +146,7 @@ manda igual — funciona, solo pierde el template corporativo.
 python tests/test_smoke.py
 ```
 
-13/13 tests OK en <2s, sin llamadas LLM ni red. El re-ranker corre en modo mock
+17/17 tests OK en <2s, sin llamadas LLM ni red. El re-ranker corre en modo mock
 (bag-of-chars determinístico) para no bajar el modelo real en los smoke tests.
 El agente OpenAI no se golpea en tests (validado solo que los tool schemas
 coincidan con `TOOL_MAP` y que el ruteo Fast/Heavy funcione).
@@ -161,7 +168,7 @@ python -m rag.reranker
 |---|---|
 | `main.py` | Entry point aiogram. Init DBs + registra router. |
 | `agent.py` | OpenAI Chat Completions + system prompt + ruteo Fast/Heavy + tool loop + tools registry. |
-| `handlers.py` | Handlers Telegram: texto, voz (Whisper), envío de docs. |
+| `handlers.py` | Handlers Telegram: texto, voz (Whisper), adjuntos PDF/DOCX/DOC/TXT, envío de docs generados. |
 | `rag/extractor.py` | Walk NAS + PyMuPDF (texto+tablas+orden por columnas) / python-docx (párrafos+tablas+headers+footers en orden natural) / antiword / TXT con auto-detección de encoding. Multiprocessing + FTS5 upsert + embeddings. Marca `status='sin_texto'` los PDFs sin capa de texto. |
 | `rag/reranker.py` | Modelo sentence-transformers + cosine reranking + modo mock. |
 | `rag/search.py` | Tools de búsqueda y lectura de páginas expuestos al agente. |
