@@ -161,6 +161,84 @@ def test_reranker_reordena_semanticamente_con_mock():
         assert "mas_similar" in primera_linea, f"esperaba mas_similar primero, got: {r}"
 
 
+def test_extractor_docx_captura_tablas_headers_y_footers():
+    """DOCX con tabla + header + footer: todo el texto termina en FTS5."""
+    _reset_reranker()
+    try:
+        import docx
+    except ImportError:
+        print("SKIP docx (python-docx no instalado)")
+        return
+    with tempfile.TemporaryDirectory() as d:
+        doc = docx.Document()
+        doc.sections[0].header.paragraphs[0].text = "HEADERUNICO Estudio MG"
+        doc.sections[0].footer.paragraphs[0].text = "FOOTERUNICO pagina 1"
+        doc.add_paragraph("Parrafo con contenido normal del escrito.")
+        t = doc.add_table(rows=2, cols=2)
+        t.cell(0, 0).text = "POLIZAABC"
+        t.cell(0, 1).text = "MONTOCIENMIL"
+        t.cell(1, 0).text = "POLIZAXYZ"
+        t.cell(1, 1).text = "MONTODOSMIL"
+        f = Path(d) / "escrito_con_tabla.docx"
+        doc.save(str(f))
+
+        db = str(Path(d) / "idx.db")
+        stats = index_root(d, db, workers=1)
+        assert stats["ok"] == 1, stats
+        search_mod.INDEX_DB = db
+
+        # Contenido de la tabla debe ser encontrable
+        r_tabla = search_mod.buscar_en_documentos("POLIZAABC MONTOCIENMIL")
+        assert "escrito_con_tabla" in r_tabla, f"tabla no indexada: {r_tabla}"
+        # Header
+        r_h = search_mod.buscar_en_documentos("HEADERUNICO")
+        assert "escrito_con_tabla" in r_h, f"header no indexado: {r_h}"
+        # Footer
+        r_f = search_mod.buscar_en_documentos("FOOTERUNICO")
+        assert "escrito_con_tabla" in r_f, f"footer no indexado: {r_f}"
+
+
+def test_extractor_txt_maneja_encoding_latin1():
+    """TXT guardado en latin-1 con acentos: se decodea sin romper."""
+    _reset_reranker()
+    with tempfile.TemporaryDirectory() as d:
+        f = Path(d) / "viejo.txt"
+        f.write_bytes("Poliza con acentuacion tipica: aeiouñ".encode("latin-1"))
+        db = str(Path(d) / "idx.db")
+        stats = index_root(d, db, workers=1)
+        assert stats["ok"] == 1, stats
+        search_mod.INDEX_DB = db
+        r = search_mod.buscar_en_documentos("acentuacion poliza")
+        assert "viejo" in r, r
+
+
+def test_extractor_pdf_sin_capa_de_texto_se_marca_sin_texto():
+    """PDF sin capa de texto (equivalente a escaneado): status='sin_texto', no rompe."""
+    _reset_reranker()
+    try:
+        import pymupdf
+    except ImportError:
+        print("SKIP pymupdf")
+        return
+    import sqlite3
+    with tempfile.TemporaryDirectory() as d:
+        pdf_path = Path(d) / "escaneado.pdf"
+        doc = pymupdf.open()
+        doc.new_page()  # pagina en blanco, sin texto
+        doc.save(str(pdf_path))
+        doc.close()
+
+        db = str(Path(d) / "idx.db")
+        stats = index_root(d, db, workers=1)
+        assert stats["ok"] == 0 and stats["sin_texto"] == 1, stats
+        assert stats["err"] == 0, stats
+
+        conn = sqlite3.connect(db)
+        row = conn.execute("SELECT status, n_chunks FROM files").fetchone()
+        assert row[0] == "sin_texto" and row[1] == 0, row
+        conn.close()
+
+
 def test_search_sin_reranker_sigue_funcionando():
     _reset_reranker()
     os.environ["USE_RERANKER"] = "0"
@@ -190,6 +268,9 @@ def main():
         test_text_cleaner_saca_markdown_y_divide,
         test_reranker_embeddings_se_pueblan_al_indexar,
         test_reranker_reordena_semanticamente_con_mock,
+        test_extractor_docx_captura_tablas_headers_y_footers,
+        test_extractor_txt_maneja_encoding_latin1,
+        test_extractor_pdf_sin_capa_de_texto_se_marca_sin_texto,
         test_search_sin_reranker_sigue_funcionando,
     ]
     fallos = 0

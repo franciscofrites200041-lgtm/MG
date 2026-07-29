@@ -139,10 +139,16 @@ manda igual — funciona, solo pierde el template corporativo.
 python tests/test_smoke.py
 ```
 
-10/10 tests OK en <2s, sin llamadas LLM ni red. El re-ranker corre en modo mock
+13/13 tests OK en <2s, sin llamadas LLM ni red. El re-ranker corre en modo mock
 (bag-of-chars determinístico) para no bajar el modelo real en los smoke tests.
 El agente OpenAI no se golpea en tests (validado solo que los tool schemas
 coincidan con `TOOL_MAP` y que el ruteo Fast/Heavy funcione).
+
+**Cobertura de extracción validada por tests:**
+- DOCX con tablas + headers + footers → todo el texto queda en FTS5.
+- TXT en encoding no-UTF (latin-1, cp1252, utf-16) → se detecta y decodea.
+- PDF sin capa de texto (equivalente a escaneado) → se marca `status='sin_texto'`
+  y queda listado, sin ensuciar el conteo de errores reales.
 
 Para validar el modelo real (una vez instalado sentence-transformers):
 ```bash
@@ -156,7 +162,7 @@ python -m rag.reranker
 | `main.py` | Entry point aiogram. Init DBs + registra router. |
 | `agent.py` | OpenAI Chat Completions + system prompt + ruteo Fast/Heavy + tool loop + tools registry. |
 | `handlers.py` | Handlers Telegram: texto, voz (Whisper), envío de docs. |
-| `rag/extractor.py` | Walk NAS + PyMuPDF/python-docx/antiword + multiprocessing + FTS5 upsert + embeddings. |
+| `rag/extractor.py` | Walk NAS + PyMuPDF (texto+tablas+orden por columnas) / python-docx (párrafos+tablas+headers+footers en orden natural) / antiword / TXT con auto-detección de encoding. Multiprocessing + FTS5 upsert + embeddings. Marca `status='sin_texto'` los PDFs sin capa de texto. |
 | `rag/reranker.py` | Modelo sentence-transformers + cosine reranking + modo mock. |
 | `rag/search.py` | Tools de búsqueda y lectura de páginas expuestos al agente. |
 | `rag/schema.sql` | DDL FTS5 + tabla chunk_embeddings. |

@@ -176,6 +176,7 @@ def stats_index() -> dict:
         conn = sqlite3.connect(INDEX_DB)
         n_files = conn.execute("SELECT COUNT(*) FROM files WHERE status='ok'").fetchone()[0]
         n_err = conn.execute("SELECT COUNT(*) FROM files WHERE status='error'").fetchone()[0]
+        n_sin_texto = conn.execute("SELECT COUNT(*) FROM files WHERE status='sin_texto'").fetchone()[0]
         n_chunks = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
         try:
             n_emb = conn.execute("SELECT COUNT(*) FROM chunk_embeddings").fetchone()[0]
@@ -185,12 +186,14 @@ def stats_index() -> dict:
         return {
             "files_ok": n_files,
             "files_err": n_err,
+            "files_sin_texto": n_sin_texto,
             "chunks": n_chunks,
             "embeddings": n_emb,
             "db_path": INDEX_DB,
         }
     except sqlite3.OperationalError:
-        return {"files_ok": 0, "files_err": 0, "chunks": 0, "embeddings": 0, "db_path": INDEX_DB}
+        return {"files_ok": 0, "files_err": 0, "files_sin_texto": 0,
+                "chunks": 0, "embeddings": 0, "db_path": INDEX_DB}
 
 
 def demo() -> None:

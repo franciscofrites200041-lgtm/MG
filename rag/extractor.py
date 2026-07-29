@@ -69,32 +69,139 @@ def walk_files(root: str) -> Iterable[Path]:
                 yield p
 
 
+def _chunk_by_words(texto: str) -> list[tuple[int, str]]:
+    palabras = texto.split()
+    out: list[tuple[int, str]] = []
+    for i in range(0, len(palabras), WORDS_PER_CHUNK):
+        trozo = " ".join(palabras[i : i + WORDS_PER_CHUNK]).strip()
+        if trozo:
+            out.append((len(out) + 1, trozo))
+    return out
+
+
+def _pdf_extract_tables_text(page) -> str:
+    # ponytail: find_tables puede fallar en PDFs raros; si truena, la pagina
+    # ya tiene el texto principal, la tabla es bonus.
+    try:
+        tabs = page.find_tables()
+    except Exception:
+        return ""
+    partes: list[str] = []
+    for t in tabs:
+        try:
+            rows = t.extract()
+        except Exception:
+            continue
+        for row in rows:
+            celdas = [str(c).strip() for c in row if c is not None and str(c).strip()]
+            if celdas:
+                partes.append(" | ".join(celdas))
+    return "\n".join(partes)
+
+
 def extract_pdf(path: Path) -> list[tuple[int, str]]:
-    import pymupdf  # ponytail: import lazy, solo cuando toca PDF
+    import pymupdf  # ponytail: import lazy
 
     out = []
     with pymupdf.open(str(path)) as doc:
         for i, page in enumerate(doc, start=1):
-            txt = page.get_text("text") or ""
-            txt = txt.strip()
+            # sort=True fuerza orden por bloques visuales (Y luego X); arregla
+            # PDFs con columnas o cajas flotantes.
+            txt = page.get_text("text", sort=True) or ""
+            tablas = _pdf_extract_tables_text(page)
+            if tablas:
+                txt = (txt.strip() + "\n\n[TABLAS]\n" + tablas).strip()
+            else:
+                txt = txt.strip()
             if txt:
                 out.append((i, txt))
     return out
+
+
+# --- DOCX helpers: iteracion en orden natural preservando parrafos + tablas ---
+
+def _docx_qn(tag: str) -> str:
+    # ponytail: qn hardcodeado, evita depender del helper interno de python-docx
+    return "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}" + tag
+
+
+def _docx_para_text(p_elem) -> str:
+    t = _docx_qn("t")
+    return "".join((el.text or "") for el in p_elem.iter(t))
+
+
+def _docx_table_text(tbl_elem) -> str:
+    """Aplana tabla: cada row -> 'c1 | c2 | c3', filas separadas por \n.
+    Cells con tablas anidadas: absorbe todo el texto interno.
+    """
+    tr = _docx_qn("tr")
+    tc = _docx_qn("tc")
+    p = _docx_qn("p")
+    lineas: list[str] = []
+    for row in tbl_elem.iter(tr):
+        celdas: list[str] = []
+        # findall directo evita cells de tablas anidadas duplicadas
+        for cell in row.findall(tc):
+            partes = [_docx_para_text(pe).strip() for pe in cell.iter(p)]
+            celdas.append(" ".join(x for x in partes if x))
+        linea = " | ".join(c for c in celdas if c).strip()
+        if linea:
+            lineas.append(linea)
+    return "\n".join(lineas)
+
+
+def _docx_body_stream(doc) -> str:
+    """Yielda todo el texto del body en orden: paragraphs + tables entremezclados."""
+    p_tag = _docx_qn("p")
+    tbl_tag = _docx_qn("tbl")
+    out: list[str] = []
+    for child in doc.element.body.iterchildren():
+        if child.tag == p_tag:
+            t = _docx_para_text(child).strip()
+            if t:
+                out.append(t)
+        elif child.tag == tbl_tag:
+            t = _docx_table_text(child)
+            if t:
+                out.append(t)
+    return "\n".join(out)
+
+
+def _docx_headers_footers(doc) -> str:
+    """Concatena headers y footers de todas las secciones."""
+    partes: list[str] = []
+    for section in doc.sections:
+        for hf_name in ("header", "footer", "first_page_header", "first_page_footer",
+                        "even_page_header", "even_page_footer"):
+            hf = getattr(section, hf_name, None)
+            if hf is None:
+                continue
+            try:
+                for para in hf.paragraphs:
+                    if para.text.strip():
+                        partes.append(para.text.strip())
+                for tbl in hf.tables:
+                    t = _docx_table_text(tbl._element)
+                    if t:
+                        partes.append(t)
+            except Exception:
+                continue
+    return "\n".join(partes)
 
 
 def extract_docx(path: Path) -> list[tuple[int, str]]:
     import docx  # python-docx
 
     d = docx.Document(str(path))
-    palabras: list[str] = []
-    for p in d.paragraphs:
-        palabras.extend(p.text.split())
-    chunks: list[tuple[int, str]] = []
-    for i in range(0, len(palabras), WORDS_PER_CHUNK):
-        trozo = " ".join(palabras[i : i + WORDS_PER_CHUNK]).strip()
-        if trozo:
-            chunks.append((len(chunks) + 1, trozo))
-    return chunks
+    piezas: list[str] = []
+    hf = _docx_headers_footers(d)
+    if hf:
+        piezas.append("[HEADER/FOOTER]\n" + hf)
+    body = _docx_body_stream(d)
+    if body:
+        piezas.append(body)
+    texto_total = "\n\n".join(piezas)
+    return _chunk_by_words(texto_total)
 
 
 def extract_doc(path: Path) -> list[tuple[int, str]]:
@@ -111,24 +218,21 @@ def extract_doc(path: Path) -> list[tuple[int, str]]:
     )
     if r.returncode != 0:
         raise RuntimeError(f"antiword falló: {r.stderr[:200]}")
-    palabras = r.stdout.split()
-    chunks: list[tuple[int, str]] = []
-    for i in range(0, len(palabras), WORDS_PER_CHUNK):
-        trozo = " ".join(palabras[i : i + WORDS_PER_CHUNK]).strip()
-        if trozo:
-            chunks.append((len(chunks) + 1, trozo))
-    return chunks
+    return _chunk_by_words(r.stdout)
 
 
 def extract_txt(path: Path) -> list[tuple[int, str]]:
-    txt = path.read_text(encoding="utf-8", errors="replace")
-    palabras = txt.split()
-    chunks: list[tuple[int, str]] = []
-    for i in range(0, len(palabras), WORDS_PER_CHUNK):
-        trozo = " ".join(palabras[i : i + WORDS_PER_CHUNK]).strip()
-        if trozo:
-            chunks.append((len(chunks) + 1, trozo))
-    return chunks
+    raw = path.read_bytes()
+    # Prueba encodings comunes; latin-1 nunca falla asi que es fallback seguro.
+    for enc in ("utf-8-sig", "utf-16", "cp1252", "latin-1"):
+        try:
+            txt = raw.decode(enc)
+            break
+        except UnicodeDecodeError:
+            continue
+    else:
+        txt = raw.decode("utf-8", errors="replace")
+    return _chunk_by_words(txt)
 
 
 EXTRACTORS = {
@@ -146,6 +250,9 @@ def process_one(path_str: str) -> Extracted:
         st = p.stat()
         fn = EXTRACTORS[ext]
         chunks = fn(p)
+        # ponytail: si el archivo no arrojo texto, marcarlo como 'sin_texto' para
+        # distinguir de un error de parseo. Ej: PDFs escaneados (sin capa de texto).
+        status = "ok" if chunks else "sin_texto"
         return Extracted(
             path=str(p),
             filename=p.name,
@@ -153,7 +260,7 @@ def process_one(path_str: str) -> Extracted:
             mtime=st.st_mtime,
             size=st.st_size,
             chunks=chunks,
-            status="ok",
+            status=status,
         )
     except Exception as e:
         logger.warning("extractor falló en %s: %s", p, e)
@@ -273,7 +380,7 @@ def index_root(
         embed,
     )
 
-    ok, err, embedded = 0, 0, 0
+    ok, err, sin_texto, embedded = 0, 0, 0, 0
 
     def _post_upsert(path: str, status: str) -> None:
         nonlocal embedded
@@ -283,34 +390,47 @@ def index_root(
             except Exception as e:
                 logger.exception("Fallo embeddings para %s: %s", path, e)
 
+    def _tally(status: str) -> None:
+        nonlocal ok, err, sin_texto
+        if status == "ok":
+            ok += 1
+        elif status == "sin_texto":
+            sin_texto += 1
+        else:
+            err += 1
+
     if workers <= 1:
         for path_str in todos:
             doc = process_one(path_str)
             upsert(conn, doc)
             _post_upsert(doc.path, doc.status)
-            if doc.status == "ok":
-                ok += 1
-            else:
-                err += 1
-            if (ok + err) % 100 == 0:
+            _tally(doc.status)
+            done = ok + err + sin_texto
+            if done % 100 == 0:
                 conn.commit()
-                logger.info("Progreso: %d/%d (ok=%d err=%d emb=%d)", ok + err, len(todos), ok, err, embedded)
+                logger.info("Progreso: %d/%d (ok=%d err=%d sin_texto=%d emb=%d)",
+                            done, len(todos), ok, err, sin_texto, embedded)
     else:
         with mp.Pool(processes=workers) as pool:
             for i, doc in enumerate(pool.imap_unordered(process_one, todos, chunksize=4), start=1):
                 upsert(conn, doc)
                 _post_upsert(doc.path, doc.status)
-                if doc.status == "ok":
-                    ok += 1
-                else:
-                    err += 1
+                _tally(doc.status)
                 if i % 100 == 0:
                     conn.commit()
-                    logger.info("Progreso: %d/%d (ok=%d err=%d emb=%d)", i, len(todos), ok, err, embedded)
+                    logger.info("Progreso: %d/%d (ok=%d err=%d sin_texto=%d emb=%d)",
+                                i, len(todos), ok, err, sin_texto, embedded)
 
     conn.commit()
     conn.close()
-    return {"total": len(todos), "ok": ok, "err": err, "saltados": saltados, "embedded": embedded}
+    return {
+        "total": len(todos),
+        "ok": ok,
+        "err": err,
+        "sin_texto": sin_texto,
+        "saltados": saltados,
+        "embedded": embedded,
+    }
 
 
 def _cli() -> None:
