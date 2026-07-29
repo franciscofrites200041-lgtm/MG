@@ -1,0 +1,13 @@
+services:
+  mg-bot:
+    build: .
+    container_name: mg-bot
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      # index.db, memory.db, escritos generados y logs
+      - ./data:/data
+      # Documentos del estudio (SMB mount o carpeta del NAS)
+      - ${NAS_ROOT}:/mnt/nas/estudio:ro
+    environment:
+      NAS_ROOT: /mnt/nas/estudio
