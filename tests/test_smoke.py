@@ -71,6 +71,17 @@ def test_elegir_modelo_rutea_a_heavy_cuando_pide_redactar():
     assert elegir_modelo("Analisis de sentencia del fallo X") == MODEL_HEAVY
 
 
+def test_agent_detecta_reasoning_models():
+    os.environ.setdefault("OPENAI_API_KEY", "dummy")
+    from agent import _is_reasoning_model
+    assert _is_reasoning_model("gpt-5")
+    assert _is_reasoning_model("gpt-5-mini")
+    assert _is_reasoning_model("o1-preview")
+    assert _is_reasoning_model("o3-mini")
+    assert not _is_reasoning_model("gpt-4o")
+    assert not _is_reasoning_model("gpt-4.1")
+
+
 def test_agent_tool_schemas_matchean_tool_map():
     os.environ.setdefault("OPENAI_API_KEY", "dummy")
     from agent import TOOL_MAP, TOOL_SCHEMAS
@@ -263,6 +274,7 @@ def main():
         test_extractor_incremental_no_reprocesa,
         test_sanitize_query_saca_puntuacion,
         test_elegir_modelo_rutea_a_heavy_cuando_pide_redactar,
+        test_agent_detecta_reasoning_models,
         test_agent_tool_schemas_matchean_tool_map,
         test_gdocs_fallback_local_genera_docx,
         test_text_cleaner_saca_markdown_y_divide,
