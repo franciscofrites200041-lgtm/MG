@@ -57,9 +57,31 @@ class Extracted:
 
 def init_db(db_path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path)
+    # ponytail: WAL + synchronous NORMAL para no fsyncar cada write. Perdemos
+    # durabilidad ante corte de luz (ok, es un indice reproducible), ganamos ~10x
+    # en throughput de writes bajo carga.
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
     conn.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
+    _migrate_files_lazy_columns(conn)
     conn.commit()
     return conn
+
+
+def _migrate_files_lazy_columns(conn: sqlite3.Connection) -> None:
+    """Agrega preview + fully_extracted a DBs viejas creadas antes del modo lazy."""
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(files)").fetchall()}
+    if "preview" not in cols:
+        conn.execute("ALTER TABLE files ADD COLUMN preview TEXT NOT NULL DEFAULT ''")
+    if "fully_extracted" not in cols:
+        conn.execute("ALTER TABLE files ADD COLUMN fully_extracted INTEGER NOT NULL DEFAULT 0")
+        # Marcar como full lo que ya tenia chunks reales (n_chunks>0 y status='ok').
+        conn.execute(
+            "UPDATE files SET fully_extracted=1 WHERE status='ok' AND n_chunks>0"
+        )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_files_fully_extracted ON files(fully_extracted)"
+    )
 
 
 def already_indexed(conn: sqlite3.Connection, path: str, mtime: float, size: int) -> bool:
@@ -319,6 +341,216 @@ EXTRACTORS = {
 }
 
 
+# --- Preview: extraccion barata para el modo lazy -------------------------
+
+PREVIEW_MAX_CHARS = 750  # ~100-125 palabras en español; suficiente para FTS5 recall
+
+
+def _preview_pdf(path: Path) -> str:
+    import pymupdf  # ponytail: import lazy
+    _silenciar_pymupdf_warnings()
+    with pymupdf.open(str(path)) as doc:
+        if doc.page_count == 0:
+            return ""
+        # ponytail: solo primera pagina, sin tablas. Costo tipico ~30-80ms.
+        txt = doc[0].get_text("text", sort=True) or ""
+    return txt.strip()[:PREVIEW_MAX_CHARS]
+
+
+def _preview_docx(path: Path) -> str:
+    import docx
+    d = docx.Document(str(path))
+    partes: list[str] = []
+    acumulado = 0
+    for para in d.paragraphs:
+        t = para.text.strip()
+        if not t:
+            continue
+        partes.append(t)
+        acumulado += len(t) + 1
+        if acumulado >= PREVIEW_MAX_CHARS:
+            break
+    return "\n".join(partes)[:PREVIEW_MAX_CHARS]
+
+
+def _preview_txt(path: Path) -> str:
+    raw = path.read_bytes()[: PREVIEW_MAX_CHARS * 4]  # 4 bytes/char worst case
+    for enc in ("utf-8-sig", "utf-16", "cp1252", "latin-1"):
+        try:
+            txt = raw.decode(enc)
+            break
+        except UnicodeDecodeError:
+            continue
+    else:
+        txt = raw.decode("utf-8", errors="replace")
+    return txt.strip()[:PREVIEW_MAX_CHARS]
+
+
+PREVIEW_EXTRACTORS = {
+    ".pdf": _preview_pdf,
+    ".docx": _preview_docx,
+    ".txt": _preview_txt,
+    # ponytail: .doc no tiene preview cheap. Word COM es lento y no hay antiword
+    # en Windows. Cae a filename-only en FTS hasta que el bg worker (Linux/antiword)
+    # o el on-demand lo promuevan. Upgrade path: instalar antiword en la PC.
+}
+
+
+def extract_preview(path: Path) -> str:
+    """Extrae los primeros ~2000 chars de un archivo. Nunca revienta.
+
+    Es la version 'lite' que corre en el walk inicial: barata en CPU y en disco,
+    solo abre la primera pagina/parrafos. Devuelve '' si el formato no tiene
+    preview o si algo falla (el archivo se indexa igual con path+filename).
+    """
+    fn = PREVIEW_EXTRACTORS.get(path.suffix.lower())
+    if fn is None:
+        return ""
+    try:
+        return fn(path)
+    except Exception as e:
+        logger.debug("preview fallo en %s: %s", path, e)
+        return ""
+
+
+@dataclass
+class LitePreview:
+    path: str
+    filename: str
+    ext: str
+    mtime: float
+    size: int
+    preview: str
+    status: str = "ok"
+
+
+def process_one_lite(path_str: str) -> LitePreview:
+    p = Path(path_str)
+    ext = p.suffix.lower()
+    try:
+        st = p.stat()
+    except OSError as e:
+        return LitePreview(str(p), p.name, ext, 0.0, 0, "", status=f"error:{e}"[:50])
+    preview = extract_preview(p)
+    return LitePreview(
+        path=str(p),
+        filename=p.name,
+        ext=ext,
+        mtime=st.st_mtime,
+        size=st.st_size,
+        preview=preview,
+        status="ok",
+    )
+
+
+def upsert_lite(conn: sqlite3.Connection, lp: LitePreview) -> None:
+    """Inserta preview en files + un chunk (page=0) en FTS5. Idempotente.
+
+    Si el archivo ya existe con fully_extracted=1, NO lo pisa (respeta el trabajo
+    del bg worker o del on-demand previo).
+    """
+    row = conn.execute(
+        "SELECT fully_extracted, mtime, size FROM files WHERE path = ?", (lp.path,)
+    ).fetchone()
+    if row and row[0] == 1 and abs(row[1] - lp.mtime) < 0.001 and row[2] == lp.size:
+        # Ya esta full y no cambio el archivo. Nada que hacer.
+        return
+    # ponytail: solo borrar si el row EXISTE. Sin este guard, cada archivo nuevo
+    # dispara un DELETE en FTS5 (path UNINDEXED) que hace scan lineal de chunks
+    # y mata el throughput a 5 files/s con 60k+ rows en DB.
+    if row is not None:
+        conn.execute(
+            "DELETE FROM chunk_embeddings WHERE chunk_rowid IN "
+            "(SELECT rowid FROM chunks WHERE path = ?)",
+            (lp.path,),
+        )
+        conn.execute("DELETE FROM chunks WHERE path = ?", (lp.path,))
+        conn.execute("DELETE FROM files WHERE path = ?", (lp.path,))
+    conn.execute(
+        "INSERT INTO files (path, filename, ext, mtime, size, n_chunks, indexed_at, "
+        "status, preview, fully_extracted) VALUES (?,?,?,?,?,?,?,?,?,0)",
+        (
+            lp.path,
+            lp.filename,
+            lp.ext,
+            lp.mtime,
+            lp.size,
+            0,
+            time.time(),
+            lp.status,
+            lp.preview,
+        ),
+    )
+    # Preview como chunk page=0. Si preview esta vacio, igual insertamos con
+    # filename para que FTS5 matchee por nombre.
+    texto_fts = lp.preview or lp.filename
+    conn.execute(
+        "INSERT INTO chunks (path, filename, page, text) VALUES (?,?,?,?)",
+        (lp.path, lp.filename, 0, texto_fts),
+    )
+
+
+def index_root_lite(
+    root: str,
+    db_path: str,
+    workers: int = 4,
+    incremental: bool = True,
+    limit: int | None = None,
+) -> dict:
+    """Indexa el root en modo lazy: solo previews (page=0) + FTS5.
+
+    Es el reemplazo del index_root pesado. Corre en horas en vez de dias.
+    Idempotente: si un archivo ya esta con fully_extracted=1 y mtime/size sin
+    cambios, lo saltea.
+    """
+    conn = init_db(db_path)
+
+    todos: list[str] = []
+    saltados = 0
+    for p in walk_files(root):
+        try:
+            st = p.stat()
+        except OSError:
+            continue
+        if incremental:
+            row = conn.execute(
+                "SELECT mtime, size, fully_extracted FROM files WHERE path = ?",
+                (str(p),),
+            ).fetchone()
+            if row and abs(row[0] - st.st_mtime) < 0.001 and row[1] == st.st_size:
+                saltados += 1
+                continue
+        todos.append(str(p))
+        if limit and len(todos) >= limit:
+            break
+
+    logger.info("Lite: a procesar=%d (saltados=%d)", len(todos), saltados)
+    ok = 0
+
+    if workers <= 1:
+        for path_str in todos:
+            lp = process_one_lite(path_str)
+            upsert_lite(conn, lp)
+            ok += 1
+            if ok % 500 == 0:
+                conn.commit()
+                logger.info("Lite progreso: %d/%d", ok, len(todos))
+    else:
+        with mp.Pool(processes=workers) as pool:
+            for i, lp in enumerate(
+                pool.imap_unordered(process_one_lite, todos, chunksize=16), start=1
+            ):
+                upsert_lite(conn, lp)
+                ok += 1
+                if i % 500 == 0:
+                    conn.commit()
+                    logger.info("Lite progreso: %d/%d", i, len(todos))
+
+    conn.commit()
+    conn.close()
+    return {"total": len(todos), "ok": ok, "saltados": saltados}
+
+
 def extraer_texto_de_archivo(path: Path, ext: str) -> tuple[str, int]:
     """Extrae texto de un archivo local ad-hoc (NO indexa; solo devuelve string).
 
@@ -389,7 +621,10 @@ def process_one(path_str: str) -> Extracted:
 
 
 def upsert(conn: sqlite3.Connection, doc: Extracted) -> None:
-    # Borra embeddings viejos ANTES de tocar chunks (usan rowid como FK logica).
+    """Escribe chunks reales (page>=1). Marca fully_extracted=1 si hubo chunks.
+
+    Borra el preview chunk (page=0) que pudiera existir de un pass lite previo.
+    """
     conn.execute(
         "DELETE FROM chunk_embeddings WHERE chunk_rowid IN "
         "(SELECT rowid FROM chunks WHERE path = ?)",
@@ -397,9 +632,10 @@ def upsert(conn: sqlite3.Connection, doc: Extracted) -> None:
     )
     conn.execute("DELETE FROM chunks WHERE path = ?", (doc.path,))
     conn.execute("DELETE FROM files WHERE path = ?", (doc.path,))
+    fully = 1 if doc.chunks else 0
     conn.execute(
-        "INSERT INTO files (path, filename, ext, mtime, size, n_chunks, indexed_at, status) "
-        "VALUES (?,?,?,?,?,?,?,?)",
+        "INSERT INTO files (path, filename, ext, mtime, size, n_chunks, indexed_at, "
+        "status, preview, fully_extracted) VALUES (?,?,?,?,?,?,?,?,?,?)",
         (
             doc.path,
             doc.filename,
@@ -409,6 +645,8 @@ def upsert(conn: sqlite3.Connection, doc: Extracted) -> None:
             len(doc.chunks),
             time.time(),
             doc.status,
+            "",
+            fully,
         ),
     )
     if doc.chunks:
@@ -416,6 +654,47 @@ def upsert(conn: sqlite3.Connection, doc: Extracted) -> None:
             "INSERT INTO chunks (path, filename, page, text) VALUES (?,?,?,?)",
             [(doc.path, doc.filename, pg, txt) for pg, txt in doc.chunks],
         )
+
+
+def promote_to_full(conn: sqlite3.Connection, path_str: str, embed: bool = True) -> dict:
+    """Extrae texto completo de un archivo previamente indexado en modo lite.
+
+    Elimina el chunk preview (page=0), corre el extractor pesado, inserta chunks
+    reales y (opcional) embeddings. Marca fully_extracted=1.
+
+    Idempotente: si ya esta full y el archivo no cambio, no hace nada.
+
+    Returns dict con {status, n_chunks, embedded, ya_estaba, error?}.
+    """
+    p = Path(path_str)
+    try:
+        st = p.stat()
+    except OSError as e:
+        return {"status": "error", "n_chunks": 0, "embedded": 0, "ya_estaba": False,
+                "error": f"stat: {e}"}
+
+    row = conn.execute(
+        "SELECT fully_extracted, mtime, size FROM files WHERE path = ?", (path_str,)
+    ).fetchone()
+    if row and row[0] == 1 and abs(row[1] - st.st_mtime) < 0.001 and row[2] == st.st_size:
+        return {"status": "ok", "n_chunks": 0, "embedded": 0, "ya_estaba": True}
+
+    doc = process_one(path_str)
+    upsert(conn, doc)
+    embedded = 0
+    if embed and doc.status == "ok" and doc.chunks:
+        try:
+            embedded = compute_embeddings_for_path(conn, path_str)
+        except Exception as e:
+            logger.warning("promote_to_full: embeddings fallaron para %s: %s", path_str, e)
+    conn.commit()
+    return {
+        "status": doc.status,
+        "n_chunks": len(doc.chunks),
+        "embedded": embedded,
+        "ya_estaba": False,
+        "error": doc.error,
+    }
 
 
 def compute_embeddings_for_path(conn: sqlite3.Connection, path: str) -> int:

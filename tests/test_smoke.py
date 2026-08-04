@@ -360,6 +360,277 @@ def test_search_sin_reranker_sigue_funcionando():
         os.environ["USE_RERANKER"] = "1"
 
 
+# --- Modo lazy: preview + on-demand + drain --------------------------------
+
+
+def test_lite_index_extrae_preview_y_marca_no_full():
+    """index_root_lite: escribe preview corto, fully_extracted=0, page=0 en chunks."""
+    _reset_reranker()
+    from rag.extractor import index_root_lite
+    import sqlite3
+    with tempfile.TemporaryDirectory() as d:
+        (Path(d) / "poliza.txt").write_text(
+            "POLIZA de seguros contra alcoholemia. " + "cuerpo extenso " * 300,
+            encoding="utf-8",
+        )
+        db = str(Path(d) / "idx.db")
+        stats = index_root_lite(d, db, workers=1)
+        assert stats["ok"] == 1, stats
+
+        conn = sqlite3.connect(db)
+        row = conn.execute(
+            "SELECT fully_extracted, n_chunks, preview FROM files"
+        ).fetchone()
+        assert row[0] == 0, row  # no full
+        assert row[1] == 0, row  # cero chunks reales
+        assert "POLIZA" in row[2] and len(row[2]) <= 2000, row[2]
+
+        # Chunk page=0 con el preview.
+        chunks = conn.execute(
+            "SELECT page, text FROM chunks WHERE path LIKE '%poliza.txt'"
+        ).fetchall()
+        assert len(chunks) == 1 and chunks[0][0] == 0, chunks
+        conn.close()
+
+
+def test_lite_incremental_saltea_lo_ya_indexado():
+    _reset_reranker()
+    from rag.extractor import index_root_lite
+    with tempfile.TemporaryDirectory() as d:
+        (Path(d) / "a.txt").write_text("hola", encoding="utf-8")
+        db = str(Path(d) / "idx.db")
+        s1 = index_root_lite(d, db, workers=1)
+        assert s1["ok"] == 1
+        s2 = index_root_lite(d, db, workers=1, incremental=True)
+        assert s2["ok"] == 0 and s2["saltados"] == 1, s2
+
+
+def test_lite_indexa_desde_fts5_y_matchea_por_preview():
+    """FTS5 encuentra el archivo aunque solo tenga preview en chunks."""
+    _reset_reranker()
+    from rag.extractor import index_root_lite
+    with tempfile.TemporaryDirectory() as d:
+        (Path(d) / "fallo_apellidorarisimo.txt").write_text(
+            "PRIMERA LINEA con APELLIDORARISIMO y otras palabras. "
+            + "resto " * 500,
+            encoding="utf-8",
+        )
+        db = str(Path(d) / "idx.db")
+        stats = index_root_lite(d, db, workers=1)
+        assert stats["ok"] == 1
+        search_mod.INDEX_DB = db
+        search_mod.MAX_PROMOTIONS_PER_QUERY = 0  # no promover, solo FTS5 sobre preview
+        try:
+            r = search_mod.buscar_en_documentos("APELLIDORARISIMO")
+            assert "fallo_apellidorarisimo" in r, r
+            assert "preview" in r.lower(), r  # marker de que es preview, no full
+        finally:
+            search_mod.MAX_PROMOTIONS_PER_QUERY = 5
+
+
+def test_promote_to_full_reemplaza_preview_con_chunks_reales():
+    _reset_reranker()
+    from rag.extractor import index_root_lite, promote_to_full
+    import sqlite3
+    with tempfile.TemporaryDirectory() as d:
+        p = Path(d) / "largo.txt"
+        p.write_text(
+            "INICIO. " + "palabra " * 2000 + " ENCONTRAME_UNICA_KEYWORD",
+            encoding="utf-8",
+        )
+        db = str(Path(d) / "idx.db")
+        index_root_lite(d, db, workers=1)
+
+        conn = sqlite3.connect(db)
+        r = promote_to_full(conn, str(p))
+        assert r["status"] == "ok" and r["n_chunks"] >= 2, r
+
+        # Ya no debe existir page=0.
+        n_preview = conn.execute(
+            "SELECT COUNT(*) FROM chunks WHERE path=? AND page=0", (str(p),)
+        ).fetchone()[0]
+        assert n_preview == 0
+
+        # fully_extracted debe estar en 1.
+        fully = conn.execute("SELECT fully_extracted FROM files WHERE path=?", (str(p),)).fetchone()[0]
+        assert fully == 1
+
+        # La keyword del final del archivo (fuera del preview) ahora es buscable.
+        search_mod.INDEX_DB = db
+        r = search_mod.buscar_en_documentos("ENCONTRAME_UNICA_KEYWORD")
+        assert "largo" in r, r
+        conn.close()
+
+
+def test_promote_to_full_es_idempotente():
+    _reset_reranker()
+    from rag.extractor import index_root_lite, promote_to_full
+    import sqlite3
+    with tempfile.TemporaryDirectory() as d:
+        p = Path(d) / "x.txt"
+        p.write_text("contenido de prueba", encoding="utf-8")
+        db = str(Path(d) / "idx.db")
+        index_root_lite(d, db, workers=1)
+        conn = sqlite3.connect(db)
+        r1 = promote_to_full(conn, str(p))
+        assert r1["status"] == "ok" and not r1["ya_estaba"]
+        r2 = promote_to_full(conn, str(p))
+        assert r2["ya_estaba"] is True, r2
+        conn.close()
+
+
+def test_search_promueve_on_demand_y_recall_mejora():
+    """La search encuentra keyword fuera de preview DESPUES de promover on-demand."""
+    _reset_reranker()
+    from rag.extractor import index_root_lite
+    with tempfile.TemporaryDirectory() as d:
+        # Keyword vive en el body, NO en el preview.
+        p = Path(d) / "brief.txt"
+        p.write_text(
+            "TITULO neutro. " + "relleno " * 3000 + " KEYWORD_ESCONDIDA final.",
+            encoding="utf-8",
+        )
+        db = str(Path(d) / "idx.db")
+        index_root_lite(d, db, workers=1)
+        search_mod.INDEX_DB = db
+        # Query por keyword del preview: matchea (encuentra por 'TITULO').
+        r_hit = search_mod.buscar_en_documentos("TITULO neutro")
+        assert "brief" in r_hit
+
+        # Query por keyword escondida: primer pass NO matchea porque solo hay preview.
+        # Pero search promueve on-demand top hits del pool, y como 'brief' esta en el
+        # pool (matcheado por 'final'), lo promueve y en el retry la KEYWORD sale.
+        r_deep = search_mod.buscar_en_documentos("KEYWORD_ESCONDIDA")
+        assert "brief" in r_deep, r_deep
+
+
+def test_drain_importa_json_y_marca_fully_extracted():
+    """El drain lee un JSON tipo bg_worker, importa chunks y setea fully_extracted=1."""
+    _reset_reranker()
+    import base64
+    import json
+    import sqlite3
+    import numpy as np
+    from scripts.drain_pending import drain_once
+    from rag.extractor import init_db
+
+    with tempfile.TemporaryDirectory() as d:
+        db = str(Path(d) / "idx.db")
+        # DB vacia con schema.
+        init_db(db).close()
+
+        drop = Path(d) / "pending"
+        drop.mkdir()
+        vec = np.array([0.1, 0.2, 0.3], dtype=np.float32)
+        payload = {
+            "path": "/nas/virtual/x.pdf",
+            "filename": "x.pdf",
+            "ext": ".pdf",
+            "mtime": 1234567.0,
+            "size": 999,
+            "status": "ok",
+            "error": None,
+            "chunks": [
+                {"page": 1, "text": "primera pagina contenido"},
+                {"page": 2, "text": "segunda pagina otro texto"},
+            ],
+            "embeddings": [
+                {"page": 1, "model": "test", "dim": 3,
+                 "vec_b64": base64.b64encode(vec.tobytes()).decode()},
+                {"page": 2, "model": "test", "dim": 3,
+                 "vec_b64": base64.b64encode(vec.tobytes()).decode()},
+            ],
+        }
+        (drop / "abc.json").write_text(json.dumps(payload), encoding="utf-8")
+
+        r = drain_once(drop, db)
+        assert r["imported"] == 1 and r["failed"] == 0, r
+        # JSON borrado tras import.
+        assert not (drop / "abc.json").exists()
+
+        conn = sqlite3.connect(db)
+        row = conn.execute(
+            "SELECT fully_extracted, n_chunks FROM files WHERE path=?",
+            (payload["path"],),
+        ).fetchone()
+        assert row == (1, 2), row
+        n_emb = conn.execute("SELECT COUNT(*) FROM chunk_embeddings").fetchone()[0]
+        assert n_emb == 2, n_emb
+        conn.close()
+
+
+def test_drain_mueve_a_failed_si_json_es_invalido():
+    from scripts.drain_pending import drain_once
+    from rag.extractor import init_db
+    with tempfile.TemporaryDirectory() as d:
+        db = str(Path(d) / "idx.db")
+        init_db(db).close()
+        drop = Path(d) / "pending"
+        drop.mkdir()
+        (drop / "malo.json").write_text("no es JSON valido", encoding="utf-8")
+        r = drain_once(drop, db)
+        assert r["failed"] == 1 and r["imported"] == 0, r
+        assert (drop / "malo.json.failed").exists()
+
+
+def test_bg_worker_produce_json_con_chunks_y_path_traducido():
+    """El worker mapea local -> nas root y serializa chunks + embeddings."""
+    _reset_reranker()
+    import json
+    from scripts.bg_worker import _process_and_serialize, _map_to_nas_path
+
+    # Test del mapeo puro
+    r = _map_to_nas_path(
+        "C:\\mg_nas_local\\ANDY-1\\file.pdf",
+        "C:\\mg_nas_local",
+        "/volume1/Publico",
+    )
+    assert r == "/volume1/Publico/ANDY-1/file.pdf", r
+
+    with tempfile.TemporaryDirectory() as d:
+        f = Path(d) / "test.txt"
+        f.write_text("contenido de prueba con palabras", encoding="utf-8")
+        payload = _process_and_serialize((str(f), d, "/nas/root", True))
+        assert payload["path"] == "/nas/root/test.txt", payload["path"]
+        assert payload["status"] == "ok"
+        assert len(payload["chunks"]) >= 1
+        assert len(payload["embeddings"]) == len(payload["chunks"])
+        # JSON debe serializar sin errores (verifica que no hay bytes crudos).
+        s = json.dumps({k: v for k, v in payload.items() if not k.startswith("_")})
+        assert len(s) > 100
+
+
+def test_migration_agrega_columnas_a_db_vieja():
+    """Una DB vieja sin preview/fully_extracted debe migrar sin perder datos."""
+    import sqlite3
+    with tempfile.TemporaryDirectory() as d:
+        db_path = Path(d) / "old.db"
+        # Simular schema viejo sin las columnas nuevas.
+        conn = sqlite3.connect(str(db_path))
+        conn.executescript("""
+            CREATE TABLE files (
+                path TEXT PRIMARY KEY, filename TEXT, ext TEXT, mtime REAL,
+                size INTEGER, n_chunks INTEGER, indexed_at REAL, status TEXT DEFAULT 'ok'
+            );
+            CREATE VIRTUAL TABLE chunks USING fts5(path UNINDEXED, filename, page UNINDEXED, text);
+        """)
+        conn.execute(
+            "INSERT INTO files VALUES ('/x/a.pdf','a.pdf','.pdf',1.0,100,3,1.0,'ok')"
+        )
+        conn.commit()
+        conn.close()
+
+        # init_db debe migrar sin romper.
+        from rag.extractor import init_db
+        conn = init_db(str(db_path))
+        row = conn.execute(
+            "SELECT preview, fully_extracted FROM files WHERE path='/x/a.pdf'"
+        ).fetchone()
+        # Como el file viejo tenia n_chunks>0 y status='ok', se marca como full.
+        assert row == ("", 1), row
+        conn.close()
+
+
 def main():
     tests = [
         test_extractor_indexa_txt_y_reencuentra,
@@ -381,6 +652,16 @@ def main():
         test_handlers_extrae_texto_de_txt_adjunto,
         test_handlers_extension_no_soportada_devuelve_vacio,
         test_search_sin_reranker_sigue_funcionando,
+        test_lite_index_extrae_preview_y_marca_no_full,
+        test_lite_incremental_saltea_lo_ya_indexado,
+        test_lite_indexa_desde_fts5_y_matchea_por_preview,
+        test_promote_to_full_reemplaza_preview_con_chunks_reales,
+        test_promote_to_full_es_idempotente,
+        test_search_promueve_on_demand_y_recall_mejora,
+        test_drain_importa_json_y_marca_fully_extracted,
+        test_drain_mueve_a_failed_si_json_es_invalido,
+        test_bg_worker_produce_json_con_chunks_y_path_traducido,
+        test_migration_agrega_columnas_a_db_vieja,
     ]
     fallos = 0
     for t in tests:
