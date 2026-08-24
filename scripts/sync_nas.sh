@@ -14,11 +14,11 @@ VIRTUAL_ROOT="${VIRTUAL_ROOT:-/volume1/Publico/Estudio}"        # prefix en Qdra
 DEST="${RCLONE_LOCAL_MIRROR:-/data/nas_mirror}"
 LOG_DIR="${LOG_DIR:-/data/logs}"
 LOCK="/tmp/mg-sync-nas.lock"
-# ponytail: solo bajamos archivos nuevos/modificados en los ultimos 30 dias.
-# Los 544k historicos ya estan en Qdrant. No hay razon de bajar el share entero (~200GB).
-MAX_AGE="${MAX_AGE:-30d}"
-# Borrar del mirror local los archivos con mtime > 60d (ya se procesaron hace rato).
-LOCAL_CLEANUP_DAYS="${LOCAL_CLEANUP_DAYS:-60}"
+# ponytail: solo bajamos archivos nuevos/modificados en el ultimo dia.
+# 1d = margen de 24h por si un sync se salta. Los historicos ya estan en Qdrant.
+MAX_AGE="${MAX_AGE:-1d}"
+# Borrar del mirror local los archivos con mtime > 7d (ya se procesaron).
+LOCAL_CLEANUP_DAYS="${LOCAL_CLEANUP_DAYS:-7}"
 
 mkdir -p "$DEST" "$LOG_DIR"
 
