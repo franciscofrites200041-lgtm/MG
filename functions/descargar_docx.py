@@ -131,17 +131,22 @@ class Action:
         # Nombre de archivo por defecto
         filename = "escrito_montoya_gherzi.docx"
 
-        # Emitir como mensaje con data URI (Open WebUI lo renderiza como link descargable)
+        # Emitir HTML explicito con download attr (fuerza descarga, no abre en tab)
         if __event_emitter__:
             data_uri = f"data:application/vnd.openxmlformats-officedocument.wordprocessingml.document;base64,{b64}"
-            md = f"\n\n📄 [**Descargar {filename}**]({data_uri})"
+            html = (
+                f'\n\n<a href="{data_uri}" download="{filename}" '
+                f'style="display:inline-block;padding:8px 16px;background:#0f172a;color:#fff;'
+                f'text-decoration:none;border-radius:6px;font-weight:600;">'
+                f'📄 Descargar {filename} ({len(b64)//1024} KB)</a>\n\n'
+            )
             await __event_emitter__({
                 "type": "message",
-                "data": {"content": md},
+                "data": {"content": html},
             })
             await __event_emitter__({
                 "type": "notification",
-                "data": {"type": "success", "content": f"DOCX generado ({len(b64) // 1024} KB base64)"},
+                "data": {"type": "success", "content": f"DOCX listo para descargar"},
             })
 
         return None
