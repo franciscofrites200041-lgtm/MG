@@ -80,8 +80,8 @@ services:
       - "443:443"
     volumes:
       - ./nginx/nginx.conf:/etc/nginx/conf.d/default.conf:ro
-      - certbot_certs:/etc/letsencrypt:ro
-      - certbot_www:/var/www/certbot:ro
+      - ./certbot_certs:/etc/letsencrypt:ro
+      - ./certbot_www:/var/www/certbot:ro
 
   # Descomentar despues del primer certbot certonly manual:
   # certbot:
@@ -98,5 +98,4 @@ volumes:
   qdrant_snapshots:
   hf_cache:
   openwebui_data:
-  certbot_certs:
-  certbot_www:
+  # ponytail: certbot_certs y certbot_www ahora son bind mounts (./certbot_certs, ./certbot_www)
