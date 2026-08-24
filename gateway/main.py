@@ -500,23 +500,46 @@ def _sse_chunk(model: str, chat_id: str, delta_text: str, finish_reason: str | N
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
 
-async def _stream_openai(messages: list[Message], model: str) -> AsyncIterator[str]:
+async def _stream_openai(messages: list[Message], model: str, hits: list[dict]) -> AsyncIterator[str]:
+    """Stream la respuesta y al final valida las citas contra los hits reales.
+    Si el LLM cita un archivo que NO esta en el contexto, agrega advertencia al final.
+    """
     client = _openai_client()
     msgs_dict = [{"role": m.role, "content": m.content} for m in messages]
     chat_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+    buffered = []  # buffer para validar citas al final
     try:
         stream = client.chat.completions.create(
             model=OPENAI_MODEL,
             messages=msgs_dict,
             stream=True,
-            temperature=0.1,  # bajo para reducir alucinaciones legales
+            temperature=0.1,
         )
         for chunk in stream:
             if not chunk.choices:
                 continue
             text = chunk.choices[0].delta.content or ""
             if text:
+                buffered.append(text)
                 yield _sse_chunk(model, chat_id, text)
+
+        # Validacion de citas post-stream (agrega footer si hay invalidas)
+        if hits:
+            full = "".join(buffered)
+            v = _validate_citations(full, hits)
+            if v["invalidas"]:
+                warning = (
+                    "\n\n---\n"
+                    f"⚠️ **Verificación de citas**: {len(v['invalidas'])} cita(s) "
+                    "no coincide(n) con archivos del contexto:\n"
+                    + "\n".join(f"  - `{c}`" for c in v["invalidas"])
+                    + "\n\nRevisar antes de usar. Esto puede ser tipeo del LLM o alucinación."
+                )
+                logger.warning("Citas invalidas: %s", v["invalidas"])
+                yield _sse_chunk(model, chat_id, warning)
+            else:
+                logger.info("Citas OK: %d validas", v["total"])
+
         yield _sse_chunk(model, chat_id, "", finish_reason="stop")
         yield "data: [DONE]\n\n"
     except Exception as e:
@@ -536,8 +559,11 @@ def _validate_citations(answer: str, hits: list[dict]) -> dict:
     """
     import re
     valid_files = {(h.get("filename") or "").lower() for h in hits}
-    # Regex flexible: acepta (archivo.pdf, pag. N), (archivo.docx pag N), etc
-    pat = re.compile(r"\(([^)]+?\.(?:pdf|docx|doc|txt))[,\s]+p[aá]g\.?\s*(\d+)\)", re.IGNORECASE)
+    # Regex acepta filenames con parentesis internos tipo "POLIZA (3).pdf"
+    pat = re.compile(
+        r"\(([^,()]*(?:\([^)]*\))?[^,()]*\.(?:pdf|docx|doc|txt))[,\s]+p[aá]g\.?\s*(\d+)\)",
+        re.IGNORECASE,
+    )
     matches = pat.findall(answer)
     validas = []
     invalidas = []
@@ -669,6 +695,16 @@ async def chat_completions(req: ChatCompletionsReq):
             model=OPENAI_MODEL, messages=msgs_dict, temperature=0.1,
         )
         text = r.choices[0].message.content or ""
+        # Validar citas
+        if hits:
+            v = _validate_citations(text, hits)
+            if v["invalidas"]:
+                text += (
+                    "\n\n---\n"
+                    f"⚠️ **Verificación de citas**: {len(v['invalidas'])} no coincide(n) "
+                    "con archivos del contexto:\n"
+                    + "\n".join(f"  - `{c}`" for c in v["invalidas"])
+                )
         return {
             "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
             "object": "chat.completion",
@@ -682,7 +718,7 @@ async def chat_completions(req: ChatCompletionsReq):
         }
 
     return StreamingResponse(
-        _stream_openai(messages, req.model),
+        _stream_openai(messages, req.model, hits),
         media_type="text/event-stream",
     )
 
