@@ -227,7 +227,8 @@ def _extract_keywords(query: str) -> list[str]:
             "dice","este","esta","estas","estos","como","cuando","donde","cual","cuales",
             "hacer","haces","cita","citar","transcribir","copiar","texto","dato","datos"}
     words = [w.strip(".,;:¿?¡!\"'()").lower() for w in query.split()]
-    return [w for w in words if len(w) >= 3 and w not in stop]
+    # min_len 2 para no perder siglas legales (AZ, IOL, ADR, CSJ, SCJ, etc)
+    return [w for w in words if len(w) >= 2 and w not in stop and not w.isdigit()]
 
 
 def _expand_query(query: str) -> list[str]:
