@@ -2,12 +2,11 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Deps del bot (para reusar rag/*)
-COPY requirements.txt /tmp/bot-requirements.txt
+# Solo las deps del gateway (autosuficiente: FastAPI + Gemini + Qdrant + embed)
 COPY gateway/requirements.txt /tmp/gw-requirements.txt
-RUN pip install --no-cache-dir -r /tmp/bot-requirements.txt -r /tmp/gw-requirements.txt
+RUN pip install --no-cache-dir -r /tmp/gw-requirements.txt
 
-# Codigo
+# Codigo (rag/ para qdrant_backend + reranker)
 COPY rag /app/rag
 COPY gateway /app/gateway
 
