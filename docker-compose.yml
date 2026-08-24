@@ -36,7 +36,10 @@ services:
       - qdrant
     volumes:
       - hf_cache:/root/.cache/huggingface
-      - /data:/data  # para bg_worker: lee /data/nas_mirror
+      - /data:/data
+      # rclone config + SSH key del host (para on-demand NAS access via Tailscale)
+      - /home/mg/.config/rclone:/root/.config/rclone:ro
+      - /home/mg/.ssh:/root/.ssh:ro
     environment:
       RAG_BACKEND: qdrant
       QDRANT_URL: http://qdrant:6333

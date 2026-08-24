@@ -2,9 +2,11 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# antiword (para .doc) + libreoffice (fallback) - opcional pero util para bg_worker
-# ponytail: solo antiword. Si aparecen muchos .doc raros que no lee, se agrega libreoffice
-RUN apt-get update && apt-get install -y --no-install-recommends antiword && \
+# antiword (para .doc) + rclone (para on-demand NAS fetching)
+RUN apt-get update && apt-get install -y --no-install-recommends antiword curl unzip && \
+    curl -s https://rclone.org/install.sh | bash && \
+    apt-get remove -y curl unzip && \
+    apt-get autoremove -y && \
     rm -rf /var/lib/apt/lists/*
 
 # Deps del gateway (autosuficiente: FastAPI + Gemini + Qdrant + embed)
