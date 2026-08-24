@@ -530,17 +530,16 @@ def _sse_chunk(model: str, chat_id: str, delta_text: str, finish_reason: str | N
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
 
-async def _stream_openai(messages: list[Message], model: str, hits: list[dict]) -> AsyncIterator[str]:
-    """Stream la respuesta y al final valida las citas contra los hits reales.
-    Si el LLM cita un archivo que NO esta en el contexto, agrega advertencia al final.
-    """
+async def _stream_openai(messages: list[Message], model: str, hits: list[dict], active_model: str = None) -> AsyncIterator[str]:
+    """Stream la respuesta y al final valida las citas contra los hits reales."""
     client = _openai_client()
     msgs_dict = [{"role": m.role, "content": m.content} for m in messages]
     chat_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
-    buffered = []  # buffer para validar citas al final
+    buffered = []
+    llm_model = active_model or OPENAI_MODEL
     try:
         stream = client.chat.completions.create(
-            model=OPENAI_MODEL,
+            model=llm_model,
             messages=msgs_dict,
             stream=True,
             temperature=0.1,
@@ -696,8 +695,18 @@ async def chat_completions(req: ChatCompletionsReq):
             ctx_block, hits = "", []
     logger.info("Intent detectado: %s", intent)
 
-    # System prompt legal PRIMERO, despues contexto RAG, despues intent hint, despues historial
-    system_stack: list[Message] = [Message(role="system", content=SYSTEM_PROMPT_LEGAL)]
+    # ponytail: para triviales usar modelo rapido + prompt minimo
+    active_model = OPENAI_QUERY_MODEL if intent == "trivial" else OPENAI_MODEL
+    if intent == "trivial":
+        SYSTEM_ACTIVE = (
+            "Sos asistente breve del Estudio Montoya-Gherzi. Responde el saludo/agradecimiento "
+            "en 1 oracion, tono profesional. Ofrece ayuda si corresponde."
+        )
+    else:
+        SYSTEM_ACTIVE = SYSTEM_PROMPT_LEGAL
+
+    # System prompt (segun intent) PRIMERO, despues contexto RAG, despues intent hint, despues historial
+    system_stack: list[Message] = [Message(role="system", content=SYSTEM_ACTIVE)]
     if ctx_block:
         system_stack.append(Message(role="system", content=ctx_block))
     if intent == "escrito":
@@ -722,7 +731,7 @@ async def chat_completions(req: ChatCompletionsReq):
         client = _openai_client()
         msgs_dict = [{"role": m.role, "content": m.content} for m in messages]
         r = client.chat.completions.create(
-            model=OPENAI_MODEL, messages=msgs_dict, temperature=0.1,
+            model=active_model, messages=msgs_dict, temperature=0.1,
         )
         text = r.choices[0].message.content or ""
         # Validar citas
@@ -748,7 +757,7 @@ async def chat_completions(req: ChatCompletionsReq):
         }
 
     return StreamingResponse(
-        _stream_openai(messages, req.model, hits),
+        _stream_openai(messages, req.model, hits, active_model=active_model),
         media_type="text/event-stream",
     )
 
