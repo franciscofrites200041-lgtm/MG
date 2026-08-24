@@ -50,6 +50,8 @@ services:
     volumes:
       - openwebui_data:/app/backend/data
     environment:
+      # Branding
+      WEBUI_NAME: "Estudio Montoya-Gherzi"
       # Apuntar al gateway como si fuera OpenAI
       OPENAI_API_BASE_URL: http://gateway:8000/v1
       OPENAI_API_KEY: dummy-not-used-but-required
