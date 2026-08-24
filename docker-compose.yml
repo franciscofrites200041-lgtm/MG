@@ -23,11 +23,7 @@ services:
       QDRANT__SERVICE__HTTP_PORT: 6333
       QDRANT__STORAGE__ON_DISK_PAYLOAD: "true"
       QDRANT__STORAGE__PERFORMANCE__MAX_SEARCH_THREADS: 4
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:6333/readyz"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
+    # ponytail: sin healthcheck, la imagen no trae curl. depends_on simple alcanza.
 
   gateway:
     build:
@@ -37,8 +33,7 @@ services:
     restart: unless-stopped
     env_file: .env
     depends_on:
-      qdrant:
-        condition: service_healthy
+      - qdrant
     volumes:
       - hf_cache:/root/.cache/huggingface
     environment:
