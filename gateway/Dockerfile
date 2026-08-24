@@ -3,10 +3,8 @@ FROM python:3.11-slim
 WORKDIR /app
 
 # antiword (para .doc) + rclone (para on-demand NAS fetching)
-RUN apt-get update && apt-get install -y --no-install-recommends antiword curl unzip && \
-    curl -s https://rclone.org/install.sh | bash && \
-    apt-get remove -y curl unzip && \
-    apt-get autoremove -y && \
+# ponytail: apt de Debian trae rclone stable, mas confiable que install.sh externo
+RUN apt-get update && apt-get install -y --no-install-recommends antiword rclone openssh-client && \
     rm -rf /var/lib/apt/lists/*
 
 # Deps del gateway (autosuficiente: FastAPI + Gemini + Qdrant + embed)
