@@ -3,14 +3,12 @@
 Flujo por request:
     1. Recibe chat completions request (mensajes + config)
     2. Toma el ultimo user message = query
-    3. Embed + Qdrant search -> top-k chunks
-    4. Arma prompt: system (con contexto RAG) + historial (compactado si excede) + query
-    5. Llama OpenAI con streaming
-    6. Devuelve chunks OpenAI-formatted al frontend
-
-Auto-compactacion:
-    Si el total_tokens estimado del historial supera COMPACT_THRESHOLD,
-    los mensajes anteriores al ultimo turno se reemplazan por un resumen.
+    3. Si es trivial -> skip RAG y contesta directo
+    4. Sino: query expansion + vector search + filename hybrid + rerank + dedupe
+    5. Contexto ampliado por (path, pag +/- CONTEXT_RADIUS) -> mas texto por hit
+    6. System prompt legal argentino riguroso
+    7. Auto-compactacion si historial >THRESHOLD
+    8. Stream a OpenAI, chunks OpenAI-compat de vuelta
 
 Endpoints:
     GET  /v1/models                    -> lista mock (Open WebUI necesita)
@@ -39,25 +37,69 @@ logger = logging.getLogger("gateway")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")               # calidad legal, no mini
 OPENAI_SUMMARIZE_MODEL = os.getenv("OPENAI_SUMMARIZE_MODEL", "gpt-4o-mini")
-OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "")  # vacio = default OpenAI
-QDRANT_TOP_K = int(os.getenv("QDRANT_TOP_K", "8"))          # hits finales al LLM (post-dedupe)
-QDRANT_POOL = int(os.getenv("QDRANT_POOL", "40"))           # candidatos pre-dedupe
-SNIPPET_CHARS = int(os.getenv("SNIPPET_CHARS", "1500"))
-COMPACT_THRESHOLD_TOKENS = int(os.getenv("COMPACT_THRESHOLD_TOKENS", "8000"))
+OPENAI_QUERY_MODEL = os.getenv("OPENAI_QUERY_MODEL", "gpt-4o-mini")
+OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "")
+QDRANT_TOP_K = int(os.getenv("QDRANT_TOP_K", "10"))              # hits finales al LLM
+QDRANT_POOL = int(os.getenv("QDRANT_POOL", "60"))                # candidatos pre-dedupe
+SNIPPET_CHARS = int(os.getenv("SNIPPET_CHARS", "1800"))
+CONTEXT_RADIUS = int(os.getenv("CONTEXT_RADIUS", "1"))           # +/- N paginas alrededor de cada hit
+COMPACT_THRESHOLD_TOKENS = int(os.getenv("COMPACT_THRESHOLD_TOKENS", "12000"))
+ENABLE_QUERY_EXPANSION = os.getenv("ENABLE_QUERY_EXPANSION", "1") not in ("0", "false", "False")
 MODEL_NAME_EXPOSED = os.getenv("MODEL_NAME_EXPOSED", "mg-bot")
 
-# Saludos triviales -> skip RAG (evita cold start + latencia + hits basura)
 _TRIVIAL_PATTERNS = {"hola", "buenas", "buen dia", "buenos dias", "buenas tardes",
                      "buenas noches", "gracias", "muchas gracias", "chau", "adios",
                      "ok", "listo", "perfecto", "genial", "dale", "si", "no", "ola"}
 
 
-app = FastAPI(title="MG RAG Gateway", version="1.0")
+# --------------------- SYSTEM PROMPT LEGAL ---------------------
+
+SYSTEM_PROMPT_LEGAL = """Eres un asistente juridico senior del Estudio Montoya-Gherzi, especializado en derecho argentino (civil, comercial, laboral, seguros, danos y perjuicios).
+
+## PRINCIPIOS INVIOLABLES
+
+1. **PRECISION ABSOLUTA**. Un detalle mal citado o inventado puede arruinar un juicio. Nunca inventas fechas, montos, nombres, articulos, jurisdicciones o citas. Si no lo ves textual en el contexto, no lo afirmas.
+
+2. **CITA OBLIGATORIA**. Todo dato factico (nombre, fecha, monto, articulo, poliza, expediente, jurisprudencia) DEBE ir acompanado de su fuente exacta en el formato:
+   `(nombre_archivo.pdf, pag. X)`
+   Si el dato aparece en varios documentos, citas TODOS.
+
+3. **FIDELIDAD TEXTUAL**. Cuando reproduces una clausula, articulo o parrafo relevante, lo transcribes ENTRE COMILLAS tal cual aparece en el snippet, sin parafrasear. Si necesitas resumir, primero pones la cita textual y despues tu resumen.
+
+4. **RECONOCER LIMITES**. Si el contexto no cubre el tema o esta incompleto, lo decis explicitamente asi: "En los documentos disponibles no consta X. Podria estar en archivos no indexados o requerir verificacion adicional." Nunca rellenas huecos con conocimiento general.
+
+5. **ESPANOL RIOPLATENSE FORMAL**. Tono profesional legal argentino. Sin anglicismos ni jerga innecesaria. Usas "usted" al referirte al usuario cuando corresponde.
+
+## ANALISIS ANTES DE RESPONDER
+
+Antes de escribir la respuesta, mentalmente:
+- Leiste CADA snippet del contexto
+- Identificaste cuales son relevantes al tema consultado
+- Ordenaste los datos citables (con path + pag)
+- Detectaste contradicciones entre documentos si las hay
+- Marcaste lo que falta o requiere verificacion
+
+## FORMATO DE RESPUESTA
+
+Estructura clara con encabezados cuando el tema lo amerita:
+- Respuesta directa al principio (1-2 oraciones).
+- Fundamento con citas.
+- Contradicciones/dudas al final si existen.
+- Si el usuario pide un escrito legal formal, lo redactas completo con formato juridico (encabezado, cuerpo, petitorio, firma).
+
+## GENERACION DE ESCRITOS
+
+Cuando te pidan redactar un escrito (demanda, contestacion, cedula, oficio, alegato, etc):
+- Usas EXCLUSIVAMENTE datos del contexto para nombres, expedientes, hechos, pruebas
+- Si un dato necesario no esta, dejas un placeholder claro: `[FALTA: nombre completo del actor]`
+- Formato: encabezado con caratula, hechos, derecho, prueba, petitorio, firma
+- Espanol juridico formal (procesal argentino)
+"""
 
 
-# --------------------- MODELS (OpenAI-compat) ---------------------
+app = FastAPI(title="MG RAG Gateway", version="2.0")
 
 
 class Message(BaseModel):
@@ -73,7 +115,7 @@ class ChatCompletionsReq(BaseModel):
     max_tokens: int | None = None
 
 
-# --------------------- LLM CALL (OpenAI) ---------------------
+# --------------------- LLM ---------------------
 
 
 def _openai_client():
@@ -85,7 +127,6 @@ def _openai_client():
 
 
 def _count_tokens(text: str) -> int:
-    """Aprox: 1 token = 4 chars. Cheap y suficiente para el threshold."""
     return max(1, len(text) // 4)
 
 
@@ -93,11 +134,10 @@ def _total_tokens(messages: list[Message]) -> int:
     return sum(_count_tokens(m.content) for m in messages)
 
 
-# --------------------- RAG ---------------------
+# --------------------- QUERY UTILS ---------------------
 
 
 def _is_trivial(query: str) -> bool:
-    """Query trivial (saludo/agradecimiento) -> no vale RAG."""
     q = query.strip().lower().rstrip("?!.").strip()
     if not q or len(q) <= 2:
         return True
@@ -110,23 +150,56 @@ def _is_trivial(query: str) -> bool:
 
 
 def _extract_keywords(query: str) -> list[str]:
-    """Palabras candidatas para keyword boost. Filtra stopwords y palabras muy cortas."""
     stop = {"de","la","el","los","las","un","una","que","en","por","para","con","sin",
             "revisa","revisar","buscar","busca","buscá","dame","dime","quiero","necesito",
             "saber","informacion","informacion","informar","archivo","archivos","documento",
             "documentos","algo","sobre","del","al","es","son","hay","por favor","favor",
-            "dice","este","esta","estas","estos","como","cuando","donde","cual","cuales"}
+            "dice","este","esta","estas","estos","como","cuando","donde","cual","cuales",
+            "hacer","haces","cita","citar","transcribir","copiar","texto","dato","datos"}
     words = [w.strip(".,;:¿?¡!\"'()").lower() for w in query.split()]
-    # >=3 chars para no perder siglas tipo "az", "iol", "adr"
     return [w for w in words if len(w) >= 3 and w not in stop]
 
 
-def _filename_hits(keywords: list[str], limit: int = 20) -> list[dict]:
-    """Hybrid retrieval: busca puntos con keyword match en filename (indice TEXT).
-
-    Devuelve dicts con misma shape que search vector (score sintetico + payload).
-    Usa MatchText que aprovecha el indice TEXT tokenizado (rapido).
+def _expand_query(query: str) -> list[str]:
+    """Pide al LLM 2-3 variantes semanticas de la query para ampliar el retrieval.
+    Cada variante es una reformulacion o palabras clave alternativas.
     """
+    if not ENABLE_QUERY_EXPANSION or not OPENAI_API_KEY:
+        return [query]
+    prompt = (
+        "Eres un asistente que reformula queries de busqueda legal argentina.\n"
+        "Genera 3 variantes semanticas de la siguiente consulta (una por linea, sin numerar, sin comentarios).\n"
+        "Las variantes deben ser palabras clave o frases cortas que capturen el TEMA CENTRAL.\n"
+        "Ej. query: 'que dice el contrato de alquiler de Perez'\n"
+        "-> alquiler Perez\n"
+        "-> contrato locacion Perez\n"
+        "-> obligaciones inquilino Perez\n\n"
+        f"Query: {query}\n"
+        "Variantes:"
+    )
+    try:
+        client = _openai_client()
+        r = client.chat.completions.create(
+            model=OPENAI_QUERY_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.3,
+            max_tokens=200,
+        )
+        text = (r.choices[0].message.content or "").strip()
+        variants = [ln.strip("-•* ").strip() for ln in text.splitlines() if ln.strip()]
+        variants = [v for v in variants if 3 <= len(v) <= 200]
+        # Original siempre primero
+        return [query] + variants[:3]
+    except Exception as e:
+        logger.warning("Query expansion fallo: %s", str(e)[:100])
+        return [query]
+
+
+# --------------------- RETRIEVAL ---------------------
+
+
+def _filename_hits(keywords: list[str], limit: int = 20) -> list[dict]:
+    """Hybrid: hits por keyword match en filename (indice TEXT en Qdrant)."""
     if not keywords:
         return []
     from rag import qdrant_backend
@@ -134,7 +207,7 @@ def _filename_hits(keywords: list[str], limit: int = 20) -> list[dict]:
     c = qdrant_backend.get_client()
     results = []
     seen_keys = set()
-    for k in keywords[:5]:  # limitar a 5 keywords para no sobrecargar
+    for k in keywords[:6]:
         try:
             batch, _ = c.scroll(
                 collection_name=qdrant_backend.COLLECTION,
@@ -147,67 +220,121 @@ def _filename_hits(keywords: list[str], limit: int = 20) -> list[dict]:
                     continue
                 seen_keys.add(key)
                 d = dict(p.payload)
-                d["score"] = 0.7  # score base para filename-match (compite con semantic)
+                d["score"] = 0.72
                 results.append(d)
         except Exception as e:
             logger.warning("filename_hits fallo kw=%r: %s", k, str(e)[:80])
     return results
 
 
+def _expand_context(hit: dict, radius: int) -> str:
+    """Trae texto de paginas adyacentes (pag +/- radius) del mismo path."""
+    if radius <= 0:
+        return hit.get("snippet") or ""
+    from rag import qdrant_backend
+    from qdrant_client.models import Filter, FieldCondition, MatchValue, Range
+    path = hit.get("path")
+    page = hit.get("page")
+    if not path or page is None:
+        return hit.get("snippet") or ""
+    try:
+        c = qdrant_backend.get_client()
+        batch, _ = c.scroll(
+            collection_name=qdrant_backend.COLLECTION,
+            scroll_filter=Filter(must=[
+                FieldCondition(key="path", match=MatchValue(value=path)),
+                FieldCondition(key="page", range=Range(gte=page - radius, lte=page + radius)),
+            ]),
+            limit=32, with_payload=True,
+        )
+        by_pg: dict[int, list[str]] = {}
+        for p in batch:
+            pg = int(p.payload.get("page", 0))
+            snip = (p.payload.get("snippet") or "").strip()
+            if snip:
+                by_pg.setdefault(pg, []).append(snip)
+        parts = []
+        for pg in sorted(by_pg.keys()):
+            joined = " ".join(by_pg[pg])[:SNIPPET_CHARS]
+            marker = " [PAG ACTUAL]" if pg == page else ""
+            parts.append(f"--- Pag. {pg}{marker} ---\n{joined}")
+        return "\n\n".join(parts) if parts else (hit.get("snippet") or "")
+    except Exception as e:
+        logger.warning("expand_context fallo path=%r pg=%s: %s", path, page, str(e)[:80])
+        return hit.get("snippet") or ""
+
+
 def _rag_context(query: str) -> tuple[str, list[dict]]:
-    """Retrieval hibrido: vector + filename match + dedupe por (path, page) + keyword boost."""
+    """Retrieval multi-fase:
+        1. Expandir query (LLM -> 3 variantes)
+        2. Cada variante: vector search + filename hybrid
+        3. Merge, keyword boost, dedupe por (path, page)
+        4. Top-K con contexto ampliado (paginas +/- radius)
+    """
     from rag import qdrant_backend, reranker
-    qvec = reranker.embed_query(query).tolist()
-    hits = qdrant_backend.search(qvec, limit=QDRANT_POOL)
+
+    variants = _expand_query(query)
+    logger.info("Query variants (%d): %r", len(variants), variants)
 
     kws = _extract_keywords(query)
+    for v in variants[1:]:
+        kws.extend(_extract_keywords(v))
+    kws = list(dict.fromkeys(kws))  # dedupe preservando orden
 
-    # ponytail: boost por keyword match en filename/snippet (semantic hits)
+    all_hits: list[dict] = []
+    for v in variants:
+        try:
+            qvec = reranker.embed_query(v).tolist()
+            all_hits.extend(qdrant_backend.search(qvec, limit=QDRANT_POOL))
+        except Exception as e:
+            logger.warning("Search v=%r fallo: %s", v[:40], str(e)[:80])
+
+    # Boost por keyword en filename/snippet
     if kws:
-        for h in hits:
+        for h in all_hits:
             hay = (h.get("filename", "") + " " + h.get("snippet", "")).lower()
             match_count = sum(1 for k in kws if k in hay)
-            h["score"] = h.get("score", 0) + 0.1 * match_count
+            h["score"] = h.get("score", 0) + 0.08 * match_count
 
-    # ponytail: hybrid - agregar hits por filename match (por si el vector no trajo el archivo target)
-    fn_hits = _filename_hits(kws, limit=20)
-    hits = hits + fn_hits
+    # Filename hybrid
+    all_hits.extend(_filename_hits(kws, limit=25))
 
-    if not hits:
+    if not all_hits:
         return "", []
 
-    # Dedupe: 1 hit por (path, page), quedarse con mejor score
+    # Dedupe por (path, page)
     best: dict[tuple, dict] = {}
-    for h in hits:
+    for h in all_hits:
         key = (h.get("path"), h.get("page"))
         if key not in best or h["score"] > best[key]["score"]:
             best[key] = h
-    hits = sorted(best.values(), key=lambda x: x["score"], reverse=True)[:QDRANT_TOP_K]
+    top = sorted(best.values(), key=lambda x: x["score"], reverse=True)[:QDRANT_TOP_K]
 
-    lines = ["## Contexto (documentos del estudio)\n"]
-    for i, h in enumerate(hits, 1):
+    # Armar contexto con paginas adyacentes
+    lines = ["## CONTEXTO — Extractos de documentos del Estudio\n"]
+    for i, h in enumerate(top, 1):
         fn = h.get("filename", "?")
         pg = h.get("page", "?")
-        snip = (h.get("snippet") or "").strip()[:SNIPPET_CHARS]
-        lines.append(f"[{i}] {fn} (pag. {pg}, score {h.get('score', 0):.2f})\n{snip}\n")
-    lines.append("\n## Instruccion\nRespondes en espanol, tono profesional legal argentino. "
-                 "Analiza CADA snippet del contexto antes de decir que no encontras nada. "
-                 "Si algo del contexto es relevante aunque sea parcialmente, usalo y citalo. "
-                 "Formato de cita OBLIGATORIO: (archivo.pdf, pag. X). "
-                 "Solo decis 'no encuentro' si ningun snippet contiene el tema.\n")
-    return "\n".join(lines), hits
+        path = h.get("path", "?")
+        expanded = _expand_context(h, CONTEXT_RADIUS)
+        lines.append(
+            f"\n### [{i}] {fn} — pag. {pg} (score {h.get('score', 0):.2f})\n"
+            f"_Ruta: {path}_\n\n{expanded}\n"
+        )
+    lines.append("\n---\n")
+    return "\n".join(lines), top
 
 
 # --------------------- COMPACTACION ---------------------
 
 
 def _summarize(messages: list[Message]) -> str:
-    """Resume una lista de mensajes en 1-2 parrafos. Llamada sincrona a OpenAI."""
     if not messages:
         return ""
     body = "\n\n".join(f"[{m.role}]: {m.content}" for m in messages)
-    prompt = ("Resumi esta conversacion en 1-2 parrafos claros, preservando datos concretos "
-              "(nombres, fechas, montos, decisiones tomadas). Zero relleno.\n\n"
+    prompt = ("Resumi esta conversacion legal en 1-2 parrafos claros, preservando datos concretos "
+              "(nombres de partes, expedientes, fechas, montos, articulos citados, decisiones tomadas). "
+              "Zero relleno.\n\n"
               f"{body}\n\nResumen:")
     try:
         client = _openai_client()
@@ -222,11 +349,9 @@ def _summarize(messages: list[Message]) -> str:
 
 
 def _maybe_compact(messages: list[Message]) -> list[Message]:
-    """Si total_tokens > threshold, resume todos menos los ultimos 4 turnos."""
     total = _total_tokens(messages)
     if total <= COMPACT_THRESHOLD_TOKENS:
         return messages
-
     system_msgs = [m for m in messages if m.role == "system"]
     non_system = [m for m in messages if m.role != "system"]
     if len(non_system) <= 4:
@@ -242,7 +367,7 @@ def _maybe_compact(messages: list[Message]) -> list[Message]:
     return system_msgs + [system_extra] + tail
 
 
-# --------------------- STREAMING SSE (OpenAI compat) ---------------------
+# --------------------- STREAMING ---------------------
 
 
 def _sse_chunk(model: str, chat_id: str, delta_text: str, finish_reason: str | None = None) -> str:
@@ -269,6 +394,7 @@ async def _stream_openai(messages: list[Message], model: str) -> AsyncIterator[s
             model=OPENAI_MODEL,
             messages=msgs_dict,
             stream=True,
+            temperature=0.1,  # bajo para reducir alucinaciones legales
         )
         for chunk in stream:
             if not chunk.choices:
@@ -305,12 +431,13 @@ def health():
         "qdrant_points": n_points,
         "openai_configured": bool(OPENAI_API_KEY),
         "model": OPENAI_MODEL,
+        "query_expansion": ENABLE_QUERY_EXPANSION,
+        "context_radius": CONTEXT_RADIUS,
     }
 
 
 @app.get("/v1/models")
 def list_models():
-    """Open WebUI llama a /v1/models al arrancar."""
     return {
         "object": "list",
         "data": [{
@@ -333,7 +460,6 @@ async def chat_completions(req: ChatCompletionsReq):
     if not last_user:
         raise HTTPException(400, "sin user message")
 
-    # ponytail: saludo trivial -> skip RAG (evita cold start MiniLM + latencia + basura)
     if _is_trivial(last_user.content):
         logger.info("Query trivial, skip RAG: %r", last_user.content)
         ctx_block, hits = "", []
@@ -344,18 +470,25 @@ async def chat_completions(req: ChatCompletionsReq):
             logger.exception("RAG fallo")
             ctx_block, hits = "", []
 
-    messages = list(req.messages)
+    # System prompt legal PRIMERO, despues contexto RAG, despues historial
+    system_stack: list[Message] = [Message(role="system", content=SYSTEM_PROMPT_LEGAL)]
     if ctx_block:
-        messages = [Message(role="system", content=ctx_block)] + messages
+        system_stack.append(Message(role="system", content=ctx_block))
+
+    # Remover systems ya presentes en req para no duplicar
+    user_msgs = [m for m in req.messages if m.role != "system"]
+    messages = system_stack + user_msgs
     messages = _maybe_compact(messages)
 
-    logger.info("Chat: hits=%d, tokens_in=~%d, stream=%s",
-                len(hits), _total_tokens(messages), req.stream)
+    logger.info("Chat: hits=%d, tokens_in=~%d, stream=%s, model=%s",
+                len(hits), _total_tokens(messages), req.stream, OPENAI_MODEL)
 
     if not req.stream:
         client = _openai_client()
         msgs_dict = [{"role": m.role, "content": m.content} for m in messages]
-        r = client.chat.completions.create(model=OPENAI_MODEL, messages=msgs_dict)
+        r = client.chat.completions.create(
+            model=OPENAI_MODEL, messages=msgs_dict, temperature=0.1,
+        )
         text = r.choices[0].message.content or ""
         return {
             "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",

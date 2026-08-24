@@ -55,11 +55,12 @@ def ensure_collection() -> None:
             vectors_config=VectorParams(size=VECTOR_SIZE, distance=Distance.COSINE),
         )
 
-    # Indices KEYWORD para filtros exactos + rangos.
+    # Indices para filtros exactos + rangos.
     for field, schema in [
         ("path", PayloadSchemaType.KEYWORD),
         ("carpeta_top", PayloadSchemaType.KEYWORD),
         ("mtime", PayloadSchemaType.FLOAT),
+        ("page", PayloadSchemaType.INTEGER),  # para Range (contexto paginas +/- N)
     ]:
         try:
             c.create_payload_index(collection_name=COLLECTION, field_name=field, field_schema=schema)
