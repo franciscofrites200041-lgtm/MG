@@ -1,14 +1,13 @@
-# Stack completa MG Bot en VPS.
+# Stack MG Bot en VPS.
 #
 # Servicios:
-#   qdrant  - vector DB, unica fuente de verdad post-migracion
-#   bot     - bot Telegram (usa Qdrant como RAG backend)
-#   api     - FastAPI para el frontend (mismo Dockerfile que el bot)
-#   nginx   - reverse proxy + serve del frontend estatico + TLS
-#   certbot - renovacion de certs Lets Encrypt (comentado hasta primer certonly)
+#   qdrant     - vector DB (unica fuente de verdad)
+#   gateway    - RAG gateway (Qdrant + Gemini) expone endpoint OpenAI-compat
+#   openwebui  - UI ChatGPT-clone con auth + persistencia de chats
+#   nginx      - reverse proxy: openwebui en /, gateway/qdrant no expuestos
+#   certbot    - TLS (comentado hasta primer certonly con dominio)
 #
-# Bind mount: /data del host se expone como /data en los containers.
-# rclone del host escribe a /data/nas_mirror -> visible en bot/api.
+# Bot Telegram y frontend viejo quedan en git history si hicieran falta.
 
 services:
   qdrant:
@@ -30,52 +29,57 @@ services:
       timeout: 5s
       retries: 3
 
-  bot:
-    build: .
-    container_name: mg-bot
-    restart: unless-stopped
-    env_file: .env
-    depends_on:
-      qdrant:
-        condition: service_healthy
-    volumes:
-      - /data:/data
-      - hf_cache:/root/.cache/huggingface
-    environment:
-      RAG_BACKEND: qdrant
-      QDRANT_URL: http://qdrant:6333
-
-  api:
+  gateway:
     build:
       context: .
-      dockerfile: api/Dockerfile
-    container_name: mg-api
+      dockerfile: gateway/Dockerfile
+    container_name: mg-gateway
     restart: unless-stopped
     env_file: .env
     depends_on:
       qdrant:
         condition: service_healthy
     volumes:
-      - /data:/data
       - hf_cache:/root/.cache/huggingface
     environment:
       RAG_BACKEND: qdrant
       QDRANT_URL: http://qdrant:6333
+    # No exponer al host: solo openwebui accede via red interna docker
+
+  openwebui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: mg-openwebui
+    restart: unless-stopped
+    depends_on:
+      - gateway
+    volumes:
+      - openwebui_data:/app/backend/data
+    environment:
+      # Apuntar al gateway como si fuera OpenAI
+      OPENAI_API_BASE_URL: http://gateway:8000/v1
+      OPENAI_API_KEY: dummy-not-used-but-required
+      # Sign-up abierto (primer usuario = admin)
+      ENABLE_SIGNUP: "true"
+      # WebUI publica
+      WEBUI_URL: http://localhost:3000
+      # Desactivar features no necesarias
+      ENABLE_OLLAMA_API: "false"
+      ENABLE_IMAGE_GENERATION: "false"
+      ENABLE_WEB_SEARCH: "false"
     ports:
-      - "127.0.0.1:8000:8000"
+      - "127.0.0.1:3000:8080"
 
   nginx:
     image: nginx:1.27-alpine
     container_name: mg-nginx
     restart: unless-stopped
     depends_on:
-      - api
+      - openwebui
     ports:
       - "80:80"
       - "443:443"
     volumes:
       - ./nginx/nginx.conf:/etc/nginx/conf.d/default.conf:ro
-      - ./frontend:/usr/share/nginx/html:ro
       - certbot_certs:/etc/letsencrypt:ro
       - certbot_www:/var/www/certbot:ro
 
@@ -93,5 +97,6 @@ volumes:
   qdrant_data:
   qdrant_snapshots:
   hf_cache:
+  openwebui_data:
   certbot_certs:
   certbot_www:

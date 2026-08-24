@@ -290,24 +290,67 @@ def _extract_doc_via_word(path: Path) -> str:
         pythoncom.CoUninitialize()
 
 
+def _soffice_bin() -> str | None:
+    """Encuentra soffice (LibreOffice headless) en PATH o en install estandar Windows."""
+    p = shutil.which("soffice") or shutil.which("soffice.exe")
+    if p:
+        return p
+    # ponytail: rutas por default de LibreOffice en Windows, sino habria que meterlo al PATH
+    for cand in (
+        r"C:\Program Files\LibreOffice\program\soffice.exe",
+        r"C:\Program Files (x86)\LibreOffice\program\soffice.exe",
+    ):
+        if os.path.exists(cand):
+            return cand
+    return None
+
+
+def _extract_via_soffice(path: Path, soffice: str) -> str:
+    """Convierte .doc -> .txt via LibreOffice headless, lee el .txt resultante.
+
+    ponytail: UserInstallation unico por invocacion. Sin esto, workers paralelos
+    se pisan el profile default y todos menos el primero fallan silencioso.
+    """
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        profile = Path(tmp) / "profile"
+        outdir = Path(tmp) / "out"
+        outdir.mkdir()
+        profile_uri = profile.as_uri()
+        r = subprocess.run(
+            [soffice, "--headless", "--norestore", "--nolockcheck", "--nofirststartwizard",
+             f"-env:UserInstallation={profile_uri}",
+             "--convert-to", "txt:Text (encoded):UTF8",
+             "--outdir", str(outdir), str(path.resolve())],
+            capture_output=True, text=True, timeout=180,
+        )
+        out = outdir / (path.stem + ".txt")
+        if not out.exists():
+            msg = (r.stderr or "").strip() or (r.stdout or "").strip() or f"rc={r.returncode}"
+            raise RuntimeError(f"soffice sin txt: {msg[:300]}")
+        return out.read_text(encoding="utf-8", errors="replace")
+
+
 def extract_doc(path: Path) -> list[tuple[int, str]]:
-    """Extrae .doc con fallback multi-plataforma:
-    - Linux/Docker (NAS): antiword (rapido y liviano).
-    - Windows: Word COM via pywin32 (requiere Word instalado).
-    - Si ninguno esta: raise para que quede como status='error'.
+    """Extrae .doc con fallback en cascada:
+    - antiword (rapido, si esta en PATH; comun en Linux/Docker)
+    - soffice --headless (LibreOffice, cross-platform)
+    - Word COM (Windows, ultimo recurso; lento y sensible al Trust Center)
     """
     if shutil.which("antiword"):
         r = subprocess.run(
             ["antiword", str(path)],
-            capture_output=True,
-            text=True,
-            timeout=120,
-            encoding="utf-8",
-            errors="replace",
+            capture_output=True, text=True, timeout=120,
+            encoding="utf-8", errors="replace",
         )
         if r.returncode != 0:
             raise RuntimeError(f"antiword fallo: {r.stderr[:200]}")
         return _chunk_by_words(r.stdout)
+
+    soffice = _soffice_bin()
+    if soffice:
+        text = _extract_via_soffice(path, soffice)
+        return _chunk_by_words(text)
 
     if sys.platform == "win32":
         try:
@@ -316,7 +359,7 @@ def extract_doc(path: Path) -> list[tuple[int, str]]:
             raise RuntimeError(f"Word COM no disponible o fallo: {e}")
         return _chunk_by_words(text)
 
-    raise RuntimeError("Ni antiword (Linux) ni pywin32+Word (Windows) disponibles para .doc")
+    raise RuntimeError("Ni antiword ni soffice (LibreOffice) ni Word COM disponibles para .doc")
 
 
 def extract_txt(path: Path) -> list[tuple[int, str]]:
