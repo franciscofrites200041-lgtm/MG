@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import AsyncIterator
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, FileResponse
 from pydantic import BaseModel
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -765,3 +765,101 @@ async def chat_completions(req: ChatCompletionsReq):
 @app.get("/")
 def root():
     return {"service": "mg-rag-gateway", "docs": "/docs"}
+
+
+# --------------------- DOWNLOAD DOCX (para Open WebUI Function) ---------------------
+
+DOCX_DIR = Path("/tmp/mg_docx")
+DOCX_DIR.mkdir(exist_ok=True)
+
+
+class DocxReq(BaseModel):
+    text: str
+    filename: str = "escrito.docx"
+
+
+@app.post("/download/docx")
+def create_docx(req: DocxReq):
+    """Genera un .docx del texto y devuelve un ID para descargarlo despues."""
+    from docx import Document
+    from docx.shared import Pt, Cm
+    from docx.enum.text import WD_PARAGRAPH_ALIGNMENT
+    import re as _re
+
+    if not req.text.strip():
+        raise HTTPException(400, "text vacio")
+
+    doc = Document()
+    style = doc.styles["Normal"]
+    style.font.name = "Times New Roman"
+    style.font.size = Pt(12)
+    for section in doc.sections:
+        section.top_margin = Cm(2.5)
+        section.bottom_margin = Cm(2.5)
+        section.left_margin = Cm(3.0)
+        section.right_margin = Cm(2.0)
+
+    text = req.text.split("\n---\n⚠️")[0].strip()
+    for raw_line in text.splitlines():
+        line = raw_line.rstrip()
+        if not line:
+            doc.add_paragraph("")
+            continue
+        mh = _re.match(r"^(#{1,3})\s+(.+)$", line)
+        if mh:
+            doc.add_heading(mh.group(2), level=len(mh.group(1)))
+            continue
+        mb = _re.match(r"^[-*]\s+(.+)$", line)
+        if mb:
+            doc.add_paragraph(mb.group(1), style="List Bullet")
+            continue
+        mn = _re.match(r"^\d+[.\)]\s+(.+)$", line)
+        if mn:
+            doc.add_paragraph(mn.group(1), style="List Number")
+            continue
+        if line.isupper() and len(line) > 4:
+            p = doc.add_paragraph()
+            p.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
+            r = p.add_run(line)
+            r.bold = True
+            continue
+        p = doc.add_paragraph()
+        for part in _re.split(r"(\*\*[^*]+\*\*)", line):
+            if part.startswith("**") and part.endswith("**"):
+                r = p.add_run(part[2:-2])
+                r.bold = True
+            else:
+                p.add_run(part)
+
+    file_id = uuid.uuid4().hex
+    filepath = DOCX_DIR / f"{file_id}.docx"
+    doc.save(filepath)
+    logger.info("DOCX generado: %s (%d bytes)", filepath, filepath.stat().st_size)
+
+    # Cleanup: borrar archivos con mas de 1 hora
+    import time as _t
+    now = _t.time()
+    for old in DOCX_DIR.glob("*.docx"):
+        if now - old.stat().st_mtime > 3600:
+            old.unlink(missing_ok=True)
+
+    return {"id": file_id, "filename": req.filename}
+
+
+@app.get("/download/docx/{file_id}")
+def get_docx(file_id: str, filename: str = "escrito.docx"):
+    """Descarga el docx generado. Nginx proxea /download/* al gateway."""
+    # ponytail: sanitizar file_id (solo hex) para evitar path traversal
+    if not file_id.replace("_", "").isalnum() or len(file_id) > 64:
+        raise HTTPException(400, "id invalido")
+    filepath = DOCX_DIR / f"{file_id}.docx"
+    if not filepath.exists():
+        raise HTTPException(404, "expirado o no existe")
+    # Sanitizar filename
+    safe_name = "".join(c for c in filename if c.isalnum() or c in "._-") or "escrito.docx"
+    return FileResponse(
+        filepath,
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        filename=safe_name,
+        headers={"Content-Disposition": f'attachment; filename="{safe_name}"'},
+    )

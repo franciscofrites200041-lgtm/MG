@@ -2,16 +2,13 @@
 title: Descargar como DOCX
 author: Estudio Montoya-Gherzi
 author_url: https://github.com/franciscofrites200041-lgtm/MG
-version: 1.0.0
+version: 2.0.0
 required_open_webui_version: 0.3.0
-requirements: python-docx
-description: Convierte el ultimo mensaje del asistente en un .docx con formato legal argentino (Times New Roman 12, A4, margenes procesales) y lo entrega como descarga.
+requirements: httpx
+description: Envia el ultimo mensaje del asistente al gateway, que genera un .docx con formato legal argentino y lo sirve como link publico.
 """
 
 from __future__ import annotations
-import base64
-import io
-import re
 from typing import Any, Awaitable, Callable, Optional
 
 from pydantic import BaseModel, Field
@@ -19,17 +16,18 @@ from pydantic import BaseModel, Field
 
 class Action:
     class Valves(BaseModel):
-        font_name: str = Field(
-            default="Times New Roman",
-            description="Fuente por default de todos los parrafos",
+        gateway_url: str = Field(
+            default="http://gateway:8000",
+            description="URL interna del gateway (dentro de la docker network)",
         )
-        font_size_pt: int = Field(
-            default=12, description="Tamaño de fuente en puntos"
+        public_base_url: str = Field(
+            default="https://bot-estudio.montoya-gherzi.com.ar",
+            description="URL publica del sitio (donde el nginx sirve /download/*)",
         )
-        margin_top_cm: float = Field(default=2.5, description="Margen superior en cm")
-        margin_bottom_cm: float = Field(default=2.5, description="Margen inferior en cm")
-        margin_left_cm: float = Field(default=3.0, description="Margen izquierdo en cm (juridico)")
-        margin_right_cm: float = Field(default=2.0, description="Margen derecho en cm")
+        default_filename: str = Field(
+            default="escrito_montoya_gherzi.docx",
+            description="Nombre por defecto del archivo",
+        )
 
     def __init__(self):
         self.valves = self.Valves()
@@ -42,11 +40,8 @@ class Action:
         __event_emitter__: Optional[Callable[[dict], Awaitable[None]]] = None,
         __event_call__: Optional[Callable[[dict], Awaitable[Any]]] = None,
     ) -> Optional[dict]:
-        from docx import Document
-        from docx.shared import Pt, Cm
-        from docx.enum.text import WD_PARAGRAPH_ALIGNMENT
+        import httpx
 
-        # Extraer ultimo mensaje del assistant
         msgs = body.get("messages", [])
         last_assistant = ""
         for m in reversed(msgs):
@@ -62,91 +57,32 @@ class Action:
                 })
             return None
 
-        # Sanear el texto: quitar footer de citas invalidas (empieza con ⚠️)
-        text = last_assistant.split("\n---\n⚠️")[0].strip()
+        filename = self.valves.default_filename
 
-        # Construir el .docx
-        doc = Document()
-        style = doc.styles["Normal"]
-        style.font.name = self.valves.font_name
-        style.font.size = Pt(self.valves.font_size_pt)
-        for section in doc.sections:
-            section.top_margin = Cm(self.valves.margin_top_cm)
-            section.bottom_margin = Cm(self.valves.margin_bottom_cm)
-            section.left_margin = Cm(self.valves.margin_left_cm)
-            section.right_margin = Cm(self.valves.margin_right_cm)
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                r = await client.post(
+                    f"{self.valves.gateway_url}/download/docx",
+                    json={"text": last_assistant, "filename": filename},
+                )
+                r.raise_for_status()
+                data = r.json()
+        except Exception as e:
+            if __event_emitter__:
+                await __event_emitter__({
+                    "type": "notification",
+                    "data": {"type": "error", "content": f"Error generando DOCX: {type(e).__name__}"},
+                })
+            return None
 
-        for raw_line in text.splitlines():
-            line = raw_line.rstrip()
-            if not line:
-                doc.add_paragraph("")
-                continue
+        file_id = data.get("id")
+        download_url = f"{self.valves.public_base_url}/download/docx/{file_id}?filename={filename}"
 
-            # Headings markdown (# / ## / ###)
-            heading_match = re.match(r"^(#{1,3})\s+(.+)$", line)
-            if heading_match:
-                level = len(heading_match.group(1))
-                content = heading_match.group(2)
-                h = doc.add_heading(content, level=level)
-                for run in h.runs:
-                    run.font.name = self.valves.font_name
-                continue
-
-            # Bullets (- item o * item)
-            bullet_match = re.match(r"^[-*]\s+(.+)$", line)
-            if bullet_match:
-                doc.add_paragraph(bullet_match.group(1), style="List Bullet")
-                continue
-
-            # Numeradas (1. item)
-            num_match = re.match(r"^\d+[.\)]\s+(.+)$", line)
-            if num_match:
-                doc.add_paragraph(num_match.group(1), style="List Number")
-                continue
-
-            # Encabezado juridico en MAYUSCULAS solo -> centrado + negrita
-            if line.isupper() and len(line) > 4:
-                p = doc.add_paragraph()
-                p.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
-                run = p.add_run(line)
-                run.bold = True
-                continue
-
-            # Parrafo comun con inline bold **texto**
-            p = doc.add_paragraph()
-            parts = re.split(r"(\*\*[^*]+\*\*)", line)
-            for part in parts:
-                if part.startswith("**") and part.endswith("**"):
-                    run = p.add_run(part[2:-2])
-                    run.bold = True
-                else:
-                    p.add_run(part)
-
-        # Serializar a base64
-        buf = io.BytesIO()
-        doc.save(buf)
-        buf.seek(0)
-        b64 = base64.b64encode(buf.read()).decode("ascii")
-
-        # Nombre de archivo por defecto
-        filename = "escrito_montoya_gherzi.docx"
-
-        # Emitir HTML explicito con download attr (fuerza descarga, no abre en tab)
         if __event_emitter__:
-            data_uri = f"data:application/vnd.openxmlformats-officedocument.wordprocessingml.document;base64,{b64}"
-            html = (
-                f'\n\n<a href="{data_uri}" download="{filename}" '
-                f'style="display:inline-block;padding:8px 16px;background:#0f172a;color:#fff;'
-                f'text-decoration:none;border-radius:6px;font-weight:600;">'
-                f'📄 Descargar {filename} ({len(b64)//1024} KB)</a>\n\n'
-            )
-            await __event_emitter__({
-                "type": "message",
-                "data": {"content": html},
-            })
+            md = f"\n\n📄 [**Descargar {filename}**]({download_url})\n\n"
+            await __event_emitter__({"type": "message", "data": {"content": md}})
             await __event_emitter__({
                 "type": "notification",
-                "data": {"type": "success", "content": f"DOCX listo para descargar"},
+                "data": {"type": "success", "content": "DOCX generado. Click en el link para descargar."},
             })
-
         return None
