@@ -55,9 +55,10 @@ services:
       # Apuntar al gateway como si fuera OpenAI
       OPENAI_API_BASE_URL: http://gateway:8000/v1
       OPENAI_API_KEY: dummy-not-used-but-required
-      # Sign-up abierto (primer usuario = admin, resto = user directo sin aprobacion)
+      # Sign-up abierto pero con aprobacion: primer user = admin, resto queda pending
+      # hasta que un admin lo apruebe manualmente desde Panel > Users.
       ENABLE_SIGNUP: "true"
-      DEFAULT_USER_ROLE: "user"
+      DEFAULT_USER_ROLE: "pending"
       # WebUI publica
       WEBUI_URL: http://localhost:3000
       # Desactivar features no necesarias
