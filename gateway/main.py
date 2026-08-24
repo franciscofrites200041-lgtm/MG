@@ -42,9 +42,16 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 OPENAI_SUMMARIZE_MODEL = os.getenv("OPENAI_SUMMARIZE_MODEL", "gpt-4o-mini")
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "")  # vacio = default OpenAI
-QDRANT_TOP_K = int(os.getenv("QDRANT_TOP_K", "8"))
+QDRANT_TOP_K = int(os.getenv("QDRANT_TOP_K", "8"))          # hits finales al LLM (post-dedupe)
+QDRANT_POOL = int(os.getenv("QDRANT_POOL", "40"))           # candidatos pre-dedupe
+SNIPPET_CHARS = int(os.getenv("SNIPPET_CHARS", "1500"))
 COMPACT_THRESHOLD_TOKENS = int(os.getenv("COMPACT_THRESHOLD_TOKENS", "8000"))
 MODEL_NAME_EXPOSED = os.getenv("MODEL_NAME_EXPOSED", "mg-bot")
+
+# Saludos triviales -> skip RAG (evita cold start + latencia + hits basura)
+_TRIVIAL_PATTERNS = {"hola", "buenas", "buen dia", "buenos dias", "buenas tardes",
+                     "buenas noches", "gracias", "muchas gracias", "chau", "adios",
+                     "ok", "listo", "perfecto", "genial", "dale", "si", "no", "ola"}
 
 
 app = FastAPI(title="MG RAG Gateway", version="1.0")
@@ -89,22 +96,70 @@ def _total_tokens(messages: list[Message]) -> int:
 # --------------------- RAG ---------------------
 
 
+def _is_trivial(query: str) -> bool:
+    """Query trivial (saludo/agradecimiento) -> no vale RAG."""
+    q = query.strip().lower().rstrip("?!.").strip()
+    if not q or len(q) <= 2:
+        return True
+    if q in _TRIVIAL_PATTERNS:
+        return True
+    words = q.split()
+    if len(words) <= 3 and all(w in _TRIVIAL_PATTERNS or len(w) <= 3 for w in words):
+        return True
+    return False
+
+
+def _extract_keywords(query: str) -> list[str]:
+    """Palabras candidatas para keyword boost. Filtra stopwords y palabras cortas."""
+    stop = {"de","la","el","los","las","un","una","que","en","por","para","con","sin",
+            "revisa","revisar","buscar","busca","buscá","dame","dime","quiero","necesito",
+            "saber","informacion","informacion","informar","archivo","archivos","documento",
+            "documentos","algo","sobre","del","al","es","son","hay","por favor","favor"}
+    words = [w.strip(".,;:¿?¡!\"'()").lower() for w in query.split()]
+    return [w for w in words if len(w) >= 4 and w not in stop]
+
+
 def _rag_context(query: str) -> tuple[str, list[dict]]:
-    """Devuelve (bloque_de_contexto_para_system, hits_json)."""
+    """Retrieval con dedupe por (path, page) + keyword boost.
+
+    Flujo:
+        1. Trae POOL candidatos (default 40)
+        2. Boost score si filename/snippet matchean keywords del query
+        3. Dedupe: 1 hit por (path, page), el de mayor score
+        4. Devuelve top TOP_K
+    """
     from rag import qdrant_backend, reranker
     qvec = reranker.embed_query(query).tolist()
-    hits = qdrant_backend.search(qvec, limit=QDRANT_TOP_K)
+    hits = qdrant_backend.search(qvec, limit=QDRANT_POOL)
     if not hits:
         return "", []
+
+    kws = _extract_keywords(query)
+    if kws:
+        for h in hits:
+            hay = (h.get("filename", "") + " " + h.get("snippet", "")).lower()
+            match_count = sum(1 for k in kws if k in hay)
+            h["score"] = h.get("score", 0) + 0.1 * match_count  # boost 0.1 por keyword
+
+    # Dedupe: 1 hit por (path, page), quedarse con mejor score
+    best: dict[tuple, dict] = {}
+    for h in hits:
+        key = (h.get("path"), h.get("page"))
+        if key not in best or h["score"] > best[key]["score"]:
+            best[key] = h
+    hits = sorted(best.values(), key=lambda x: x["score"], reverse=True)[:QDRANT_TOP_K]
+
     lines = ["## Contexto (documentos del estudio)\n"]
     for i, h in enumerate(hits, 1):
         fn = h.get("filename", "?")
         pg = h.get("page", "?")
-        snip = (h.get("snippet") or "").strip()
-        lines.append(f"[{i}] {fn} (pag. {pg})\n{snip}\n")
-    lines.append("\n## Instruccion\nRespondes en espanol. "
-                 "Citas SIEMPRE con el formato (archivo.pdf, pag. X) cuando uses "
-                 "un dato del contexto. Si el contexto no cubre la pregunta, decilo.\n")
+        snip = (h.get("snippet") or "").strip()[:SNIPPET_CHARS]
+        lines.append(f"[{i}] {fn} (pag. {pg}, score {h.get('score', 0):.2f})\n{snip}\n")
+    lines.append("\n## Instruccion\nRespondes en espanol, tono profesional legal argentino. "
+                 "Analiza CADA snippet del contexto antes de decir que no encontras nada. "
+                 "Si algo del contexto es relevante aunque sea parcialmente, usalo y citalo. "
+                 "Formato de cita OBLIGATORIO: (archivo.pdf, pag. X). "
+                 "Solo decis 'no encuentro' si ningun snippet contiene el tema.\n")
     return "\n".join(lines), hits
 
 
@@ -243,11 +298,16 @@ async def chat_completions(req: ChatCompletionsReq):
     if not last_user:
         raise HTTPException(400, "sin user message")
 
-    try:
-        ctx_block, hits = _rag_context(last_user.content)
-    except Exception as e:
-        logger.exception("RAG fallo")
+    # ponytail: saludo trivial -> skip RAG (evita cold start MiniLM + latencia + basura)
+    if _is_trivial(last_user.content):
+        logger.info("Query trivial, skip RAG: %r", last_user.content)
         ctx_block, hits = "", []
+    else:
+        try:
+            ctx_block, hits = _rag_context(last_user.content)
+        except Exception as e:
+            logger.exception("RAG fallo")
+            ctx_block, hits = "", []
 
     messages = list(req.messages)
     if ctx_block:
