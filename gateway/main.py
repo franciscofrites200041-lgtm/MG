@@ -43,10 +43,13 @@ OPENAI_QUERY_MODEL = os.getenv("OPENAI_QUERY_MODEL", "gpt-4o-mini")
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "")
 QDRANT_TOP_K = int(os.getenv("QDRANT_TOP_K", "10"))              # hits finales al LLM
 QDRANT_POOL = int(os.getenv("QDRANT_POOL", "60"))                # candidatos pre-dedupe
+RERANK_TOP_N = int(os.getenv("RERANK_TOP_N", "30"))              # top-N que pasan por cross-encoder
 SNIPPET_CHARS = int(os.getenv("SNIPPET_CHARS", "1800"))
 CONTEXT_RADIUS = int(os.getenv("CONTEXT_RADIUS", "1"))           # +/- N paginas alrededor de cada hit
 COMPACT_THRESHOLD_TOKENS = int(os.getenv("COMPACT_THRESHOLD_TOKENS", "12000"))
 ENABLE_QUERY_EXPANSION = os.getenv("ENABLE_QUERY_EXPANSION", "1") not in ("0", "false", "False")
+ENABLE_CROSS_ENCODER = os.getenv("ENABLE_CROSS_ENCODER", "1") not in ("0", "false", "False")
+CROSS_ENCODER_MODEL = os.getenv("CROSS_ENCODER_MODEL", "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1")
 MODEL_NAME_EXPOSED = os.getenv("MODEL_NAME_EXPOSED", "mg-bot")
 
 _TRIVIAL_PATTERNS = {"hola", "buenas", "buen dia", "buenos dias", "buenas tardes",
@@ -198,6 +201,42 @@ def _expand_query(query: str) -> list[str]:
 # --------------------- RETRIEVAL ---------------------
 
 
+_ce_model = None
+
+
+def _cross_encoder():
+    """Carga lazy del cross-encoder (multilingual). Compartido entre requests."""
+    global _ce_model
+    if _ce_model is not None:
+        return _ce_model
+    if not ENABLE_CROSS_ENCODER:
+        return None
+    try:
+        from sentence_transformers import CrossEncoder
+        logger.info("Cargando cross-encoder %s...", CROSS_ENCODER_MODEL)
+        _ce_model = CrossEncoder(CROSS_ENCODER_MODEL)
+        return _ce_model
+    except Exception as e:
+        logger.warning("Cross-encoder no disponible: %s", str(e)[:100])
+        return None
+
+
+def _rerank(query: str, hits: list[dict], top_n: int) -> list[dict]:
+    """Rerank con cross-encoder. Devuelve top_n reordenados por relevancia real query-snippet."""
+    ce = _cross_encoder()
+    if ce is None or not hits:
+        return hits[:top_n]
+    pairs = [(query, (h.get("filename", "") + " " + (h.get("snippet") or ""))[:2000]) for h in hits]
+    try:
+        scores = ce.predict(pairs, show_progress_bar=False)
+        for h, s in zip(hits, scores):
+            h["_ce_score"] = float(s)
+        return sorted(hits, key=lambda x: x.get("_ce_score", 0), reverse=True)[:top_n]
+    except Exception as e:
+        logger.warning("Rerank fallo: %s", str(e)[:100])
+        return hits[:top_n]
+
+
 def _filename_hits(keywords: list[str], limit: int = 20) -> list[dict]:
     """Hybrid: hits por keyword match en filename (indice TEXT en Qdrant)."""
     if not keywords:
@@ -308,7 +347,16 @@ def _rag_context(query: str) -> tuple[str, list[dict]]:
         key = (h.get("path"), h.get("page"))
         if key not in best or h["score"] > best[key]["score"]:
             best[key] = h
-    top = sorted(best.values(), key=lambda x: x["score"], reverse=True)[:QDRANT_TOP_K]
+    dedup = sorted(best.values(), key=lambda x: x["score"], reverse=True)[:RERANK_TOP_N]
+
+    # Rerank con cross-encoder (query vs snippet real) -> mejor precision
+    top = _rerank(query, dedup, QDRANT_TOP_K)
+    logger.info("Retrieval: %d candidatos -> dedup=%d -> rerank -> top=%d",
+                len(all_hits), len(dedup), len(top))
+    for i, h in enumerate(top[:5], 1):
+        logger.info("  [%d] score=%.2f ce=%.2f  %s p.%s",
+                    i, h.get("score", 0), h.get("_ce_score", 0),
+                    h.get("filename", "?"), h.get("page", "?"))
 
     # Armar contexto con paginas adyacentes
     lines = ["## CONTEXTO — Extractos de documentos del Estudio\n"]
@@ -412,6 +460,56 @@ async def _stream_openai(messages: list[Message], model: str) -> AsyncIterator[s
 
 
 # --------------------- ENDPOINTS ---------------------
+
+
+def _validate_citations(answer: str, hits: list[dict]) -> dict:
+    """Extrae citas del texto y verifica que los filenames existan en hits.
+    Formato buscado: (archivo.ext, pag. N) o variantes.
+    Devuelve estadisticas: total_citas, validas, invalidas (filenames que no estan en hits).
+    """
+    import re
+    valid_files = {(h.get("filename") or "").lower() for h in hits}
+    # Regex flexible: acepta (archivo.pdf, pag. N), (archivo.docx pag N), etc
+    pat = re.compile(r"\(([^)]+?\.(?:pdf|docx|doc|txt))[,\s]+p[aá]g\.?\s*(\d+)\)", re.IGNORECASE)
+    matches = pat.findall(answer)
+    validas = []
+    invalidas = []
+    for fn, pg in matches:
+        fn_clean = fn.strip().lower()
+        (validas if fn_clean in valid_files else invalidas).append(f"{fn} p.{pg}")
+    return {
+        "total": len(matches),
+        "validas": validas,
+        "invalidas": invalidas,
+    }
+
+
+@app.post("/debug/query")
+async def debug_query(req: dict):
+    """Endpoint de debug: recibe {'query': '...'} y devuelve hits + citas si querés testear.
+    Uso: docker exec mg-gateway python -c "import urllib.request,json; ..."
+    """
+    q = req.get("query", "").strip()
+    if not q:
+        raise HTTPException(400, "query vacia")
+    if _is_trivial(q):
+        return {"trivial": True, "hits": []}
+    ctx, hits = _rag_context(q)
+    return {
+        "trivial": False,
+        "n_hits": len(hits),
+        "top_hits": [
+            {
+                "filename": h.get("filename"),
+                "page": h.get("page"),
+                "score": h.get("score"),
+                "ce_score": h.get("_ce_score"),
+                "snippet_preview": (h.get("snippet") or "")[:200],
+            }
+            for h in hits
+        ],
+        "context_chars": len(ctx),
+    }
 
 
 @app.get("/health")
