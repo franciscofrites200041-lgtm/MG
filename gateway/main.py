@@ -110,36 +110,71 @@ def _is_trivial(query: str) -> bool:
 
 
 def _extract_keywords(query: str) -> list[str]:
-    """Palabras candidatas para keyword boost. Filtra stopwords y palabras cortas."""
+    """Palabras candidatas para keyword boost. Filtra stopwords y palabras muy cortas."""
     stop = {"de","la","el","los","las","un","una","que","en","por","para","con","sin",
             "revisa","revisar","buscar","busca","buscá","dame","dime","quiero","necesito",
             "saber","informacion","informacion","informar","archivo","archivos","documento",
-            "documentos","algo","sobre","del","al","es","son","hay","por favor","favor"}
+            "documentos","algo","sobre","del","al","es","son","hay","por favor","favor",
+            "dice","este","esta","estas","estos","como","cuando","donde","cual","cuales"}
     words = [w.strip(".,;:¿?¡!\"'()").lower() for w in query.split()]
-    return [w for w in words if len(w) >= 4 and w not in stop]
+    # >=3 chars para no perder siglas tipo "az", "iol", "adr"
+    return [w for w in words if len(w) >= 3 and w not in stop]
+
+
+def _filename_hits(keywords: list[str], limit: int = 20) -> list[dict]:
+    """Hybrid retrieval: busca puntos con keyword match en filename (indice TEXT).
+
+    Devuelve dicts con misma shape que search vector (score sintetico + payload).
+    Usa MatchText que aprovecha el indice TEXT tokenizado (rapido).
+    """
+    if not keywords:
+        return []
+    from rag import qdrant_backend
+    from qdrant_client.models import Filter, FieldCondition, MatchText
+    c = qdrant_backend.get_client()
+    results = []
+    seen_keys = set()
+    for k in keywords[:5]:  # limitar a 5 keywords para no sobrecargar
+        try:
+            batch, _ = c.scroll(
+                collection_name=qdrant_backend.COLLECTION,
+                scroll_filter=Filter(must=[FieldCondition(key="filename", match=MatchText(text=k))]),
+                limit=limit, with_payload=True,
+            )
+            for p in batch:
+                key = (p.payload.get("path"), p.payload.get("page"))
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                d = dict(p.payload)
+                d["score"] = 0.7  # score base para filename-match (compite con semantic)
+                results.append(d)
+        except Exception as e:
+            logger.warning("filename_hits fallo kw=%r: %s", k, str(e)[:80])
+    return results
 
 
 def _rag_context(query: str) -> tuple[str, list[dict]]:
-    """Retrieval con dedupe por (path, page) + keyword boost.
-
-    Flujo:
-        1. Trae POOL candidatos (default 40)
-        2. Boost score si filename/snippet matchean keywords del query
-        3. Dedupe: 1 hit por (path, page), el de mayor score
-        4. Devuelve top TOP_K
-    """
+    """Retrieval hibrido: vector + filename match + dedupe por (path, page) + keyword boost."""
     from rag import qdrant_backend, reranker
     qvec = reranker.embed_query(query).tolist()
     hits = qdrant_backend.search(qvec, limit=QDRANT_POOL)
-    if not hits:
-        return "", []
 
     kws = _extract_keywords(query)
+
+    # ponytail: boost por keyword match en filename/snippet (semantic hits)
     if kws:
         for h in hits:
             hay = (h.get("filename", "") + " " + h.get("snippet", "")).lower()
             match_count = sum(1 for k in kws if k in hay)
-            h["score"] = h.get("score", 0) + 0.1 * match_count  # boost 0.1 por keyword
+            h["score"] = h.get("score", 0) + 0.1 * match_count
+
+    # ponytail: hybrid - agregar hits por filename match (por si el vector no trajo el archivo target)
+    fn_hits = _filename_hits(kws, limit=20)
+    hits = hits + fn_hits
+
+    if not hits:
+        return "", []
 
     # Dedupe: 1 hit por (path, page), quedarse con mejor score
     best: dict[tuple, dict] = {}

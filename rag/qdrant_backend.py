@@ -39,29 +39,46 @@ def get_client():
 
 
 def ensure_collection() -> None:
-    """Crea la coleccion si no existe. Idempotente."""
-    from qdrant_client.models import Distance, VectorParams, PayloadSchemaType
+    """Crea la coleccion si no existe + asegura indices (incluido TEXT para filename).
+    Idempotente: se puede correr multiples veces sin efecto negativo."""
+    from qdrant_client.models import (
+        Distance, VectorParams, PayloadSchemaType,
+        TextIndexParams, TokenizerType,
+    )
 
     c = get_client()
     existing = {col.name for col in c.get_collections().collections}
-    if COLLECTION in existing:
-        return
-    logger.info("Creando coleccion %s (dim=%d, cosine)", COLLECTION, VECTOR_SIZE)
-    c.create_collection(
-        collection_name=COLLECTION,
-        vectors_config=VectorParams(size=VECTOR_SIZE, distance=Distance.COSINE),
-    )
-    # Indices en payload para filtros rapidos.
+    if COLLECTION not in existing:
+        logger.info("Creando coleccion %s (dim=%d, cosine)", COLLECTION, VECTOR_SIZE)
+        c.create_collection(
+            collection_name=COLLECTION,
+            vectors_config=VectorParams(size=VECTOR_SIZE, distance=Distance.COSINE),
+        )
+
+    # Indices KEYWORD para filtros exactos + rangos.
     for field, schema in [
         ("path", PayloadSchemaType.KEYWORD),
         ("carpeta_top", PayloadSchemaType.KEYWORD),
-        ("filename", PayloadSchemaType.KEYWORD),
         ("mtime", PayloadSchemaType.FLOAT),
     ]:
         try:
             c.create_payload_index(collection_name=COLLECTION, field_name=field, field_schema=schema)
         except Exception as e:
-            logger.warning("Index %s ya existia o fallo: %s", field, e)
+            logger.warning("Index %s ya existia: %s", field, str(e)[:80])
+
+    # filename como TEXT (full-text con tokenizacion) para hybrid search.
+    try:
+        c.create_payload_index(
+            collection_name=COLLECTION,
+            field_name="filename",
+            field_schema=TextIndexParams(
+                type="text",
+                tokenizer=TokenizerType.WORD,
+                min_token_len=2, max_token_len=30, lowercase=True,
+            ),
+        )
+    except Exception as e:
+        logger.warning("Index filename(text) ya existia: %s", str(e)[:80])
 
 
 _ID_NS = uuid.UUID("6f9619ff-8b86-d011-b42d-00c04fc964ff")  # namespace fijo para determinismo
