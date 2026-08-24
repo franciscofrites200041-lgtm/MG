@@ -305,15 +305,21 @@ def _rerank(query: str, hits: list[dict], top_n: int) -> list[dict]:
 
 
 def _filename_hits(keywords: list[str], limit: int = 20) -> list[dict]:
-    """Hybrid: hits por keyword match en filename (indice TEXT en Qdrant)."""
+    """Hybrid: hits por keyword match en filename (indice TEXT en Qdrant).
+
+    Marca hits con `_source='filename'` para que el pipeline los proteja del rerank.
+    Score = 1.0 + 0.1 * keywords_matched (multiples matches = mas confianza).
+    """
     if not keywords:
         return []
     from rag import qdrant_backend
     from qdrant_client.models import Filter, FieldCondition, MatchText
     c = qdrant_backend.get_client()
-    results = []
-    seen_keys = set()
-    for k in keywords[:6]:
+
+    # Contar matches por (path, page) para saber cuantos keywords matchean
+    match_count: dict[tuple, int] = {}
+    payload_by_key: dict[tuple, dict] = {}
+    for k in keywords[:8]:
         try:
             batch, _ = c.scroll(
                 collection_name=qdrant_backend.COLLECTION,
@@ -322,15 +328,19 @@ def _filename_hits(keywords: list[str], limit: int = 20) -> list[dict]:
             )
             for p in batch:
                 key = (p.payload.get("path"), p.payload.get("page"))
-                if key in seen_keys:
-                    continue
-                seen_keys.add(key)
-                d = dict(p.payload)
-                d["score"] = 0.72
-                results.append(d)
+                match_count[key] = match_count.get(key, 0) + 1
+                payload_by_key[key] = p.payload
         except Exception as e:
             logger.warning("filename_hits fallo kw=%r: %s", k, str(e)[:80])
-    return results
+
+    results = []
+    for key, cnt in sorted(match_count.items(), key=lambda x: -x[1]):
+        d = dict(payload_by_key[key])
+        d["score"] = 1.0 + 0.1 * cnt              # score alto para competir con vector
+        d["_source"] = "filename"
+        d["_kw_matches"] = cnt
+        results.append(d)
+    return results[:limit]
 
 
 def _expand_context(hit: dict, radius: int) -> str:
@@ -408,22 +418,41 @@ def _rag_context(query: str) -> tuple[str, list[dict]]:
     if not all_hits:
         return "", []
 
-    # Dedupe por (path, page)
+    # Dedupe por (path, page). Si hay conflicto vector vs filename, PROTEGER filename.
     best: dict[tuple, dict] = {}
     for h in all_hits:
         key = (h.get("path"), h.get("page"))
-        if key not in best or h["score"] > best[key]["score"]:
+        # Filename hit siempre gana (queremos protegerlo del rerank)
+        if key not in best:
             best[key] = h
-    dedup = sorted(best.values(), key=lambda x: x["score"], reverse=True)[:RERANK_TOP_N]
+        elif h.get("_source") == "filename" and best[key].get("_source") != "filename":
+            best[key] = h
+        elif h.get("_source") != "filename" and best[key].get("_source") == "filename":
+            pass  # mantener el filename hit
+        elif h["score"] > best[key]["score"]:
+            best[key] = h
 
-    # Rerank con cross-encoder (query vs snippet real) -> mejor precision
-    top = _rerank(query, dedup, QDRANT_TOP_K)
-    logger.info("Retrieval: %d candidatos -> dedup=%d -> rerank -> top=%d",
-                len(all_hits), len(dedup), len(top))
-    for i, h in enumerate(top[:5], 1):
-        logger.info("  [%d] score=%.2f ce=%.2f  %s p.%s",
-                    i, h.get("score", 0), h.get("_ce_score", 0),
-                    h.get("filename", "?"), h.get("page", "?"))
+    # Separar filename-hits (protegidos) de semantic-hits (rerankeables)
+    fn_protected = [h for h in best.values() if h.get("_source") == "filename"]
+    semantic = [h for h in best.values() if h.get("_source") != "filename"]
+    fn_protected.sort(key=lambda x: (-x.get("_kw_matches", 0), -x.get("score", 0)))
+    semantic.sort(key=lambda x: -x["score"])
+    semantic = semantic[:RERANK_TOP_N]
+
+    # Rerank SOLO los semantic (los filename ya son alta confianza)
+    semantic_reranked = _rerank(query, semantic, QDRANT_TOP_K)
+
+    # Merge: reservar hasta N_FILENAME_SLOTS slots para filename-hits + resto semantic
+    n_fn_slots = min(len(fn_protected), max(3, QDRANT_TOP_K // 2))
+    top = fn_protected[:n_fn_slots] + semantic_reranked[:QDRANT_TOP_K - n_fn_slots]
+
+    logger.info("Retrieval: %d cand -> dedup=%d (fn=%d, sem=%d) -> rerank sem -> top=%d (fn_slots=%d)",
+                len(all_hits), len(best), len(fn_protected), len(semantic), len(top), n_fn_slots)
+    for i, h in enumerate(top[:6], 1):
+        src = h.get("_source", "vec")
+        logger.info("  [%d] src=%s score=%.2f ce=%.2f kw=%d  %s p.%s",
+                    i, src, h.get("score", 0), h.get("_ce_score", 0),
+                    h.get("_kw_matches", 0), h.get("filename", "?"), h.get("page", "?"))
 
     # Armar contexto con paginas adyacentes
     lines = ["## CONTEXTO — Extractos de documentos del Estudio\n"]
