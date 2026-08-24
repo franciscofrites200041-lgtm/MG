@@ -36,6 +36,7 @@ services:
       - qdrant
     volumes:
       - hf_cache:/root/.cache/huggingface
+      - /data:/data  # para bg_worker: lee /data/nas_mirror
     environment:
       RAG_BACKEND: qdrant
       QDRANT_URL: http://qdrant:6333
