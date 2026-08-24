@@ -14,6 +14,11 @@ VIRTUAL_ROOT="${VIRTUAL_ROOT:-/volume1/Publico/Estudio}"        # prefix en Qdra
 DEST="${RCLONE_LOCAL_MIRROR:-/data/nas_mirror}"
 LOG_DIR="${LOG_DIR:-/data/logs}"
 LOCK="/tmp/mg-sync-nas.lock"
+# ponytail: solo bajamos archivos nuevos/modificados en los ultimos 30 dias.
+# Los 544k historicos ya estan en Qdrant. No hay razon de bajar el share entero (~200GB).
+MAX_AGE="${MAX_AGE:-30d}"
+# Borrar del mirror local los archivos con mtime > 60d (ya se procesaron hace rato).
+LOCAL_CLEANUP_DAYS="${LOCAL_CLEANUP_DAYS:-60}"
 
 mkdir -p "$DEST" "$LOG_DIR"
 
@@ -23,9 +28,12 @@ if ! flock -n 200; then
   exit 0
 fi
 
-echo "[$(date -Is)] === Sync NAS -> $DEST ==="
+echo "[$(date -Is)] === Copy NAS (max-age=$MAX_AGE) -> $DEST ==="
 
-rclone sync "${REMOTE}:${SRC}" "$DEST" \
+# rclone copy (NO sync): baja solo lo que falta, no borra remotos.
+# --max-age limita a archivos modificados en la ventana. Los historicos NO se bajan.
+rclone copy "${REMOTE}:${SRC}" "$DEST" \
+  --max-age "$MAX_AGE" \
   --sftp-disable-hashcheck \
   --timeout 30m \
   --sftp-idle-timeout 5m \
@@ -43,7 +51,7 @@ rclone sync "${REMOTE}:${SRC}" "$DEST" \
   --log-file "$LOG_DIR/rclone-$(date +%Y%m%d).log" \
   --log-level INFO
 
-echo "[$(date -Is)] === Procesar nuevos con bg_worker_qdrant ==="
+echo "[$(date -Is)] === Procesar con bg_worker_qdrant (skipea lo ya indexado) ==="
 
 # ponytail: corre en el container gateway (ya tiene torch, sentence-transformers, qdrant-client)
 docker exec mg-gateway python /app/scripts/bg_worker_qdrant.py \
@@ -52,4 +60,11 @@ docker exec mg-gateway python /app/scripts/bg_worker_qdrant.py \
   --workers 1 \
   2>&1 | tee -a "$LOG_DIR/bg_worker-$(date +%Y%m%d).log"
 
+echo "[$(date -Is)] === Cleanup mirror local (mtime > ${LOCAL_CLEANUP_DAYS}d) ==="
+# Libera espacio: los procesados hace mas de N dias se borran del mirror local.
+# Siguen indexados en Qdrant. Si se modifican en el NAS, rclone los baja de nuevo.
+find "$DEST" -type f -mtime "+${LOCAL_CLEANUP_DAYS}" -delete 2>/dev/null || true
+find "$DEST" -type d -empty -delete 2>/dev/null || true
+
 echo "[$(date -Is)] === Fin ==="
+df -h "$DEST" | tail -1
