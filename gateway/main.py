@@ -51,6 +51,7 @@ ENABLE_QUERY_EXPANSION = os.getenv("ENABLE_QUERY_EXPANSION", "1") not in ("0", "
 ENABLE_CROSS_ENCODER = os.getenv("ENABLE_CROSS_ENCODER", "1") not in ("0", "false", "False")
 CROSS_ENCODER_MODEL = os.getenv("CROSS_ENCODER_MODEL", "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1")
 MODEL_NAME_EXPOSED = os.getenv("MODEL_NAME_EXPOSED", "mg-bot")
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "https://bot-estudio.montoya-gherzi.com.ar")
 
 _TRIVIAL_PATTERNS = {"hola", "buenas", "buen dia", "buenos dias", "buenas tardes",
                      "buenas noches", "gracias", "muchas gracias", "chau", "adios",
@@ -530,7 +531,7 @@ def _sse_chunk(model: str, chat_id: str, delta_text: str, finish_reason: str | N
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
 
-async def _stream_openai(messages: list[Message], model: str, hits: list[dict], active_model: str = None) -> AsyncIterator[str]:
+async def _stream_openai(messages: list[Message], model: str, hits: list[dict], active_model: str = None, intent: str = "consulta") -> AsyncIterator[str]:
     """Stream la respuesta y al final valida las citas contra los hits reales."""
     client = _openai_client()
     msgs_dict = [{"role": m.role, "content": m.content} for m in messages]
@@ -568,6 +569,17 @@ async def _stream_openai(messages: list[Message], model: str, hits: list[dict], 
                 yield _sse_chunk(model, chat_id, warning)
             else:
                 logger.info("Citas OK: %d validas", v["total"])
+
+        # Si es escrito legal, generar DOCX automatico y agregar link al final
+        if intent == "escrito":
+            try:
+                full = "".join(buffered)
+                docx_url = _generate_docx_link(full, "escrito_montoya_gherzi.docx")
+                if docx_url:
+                    footer = f"\n\n---\n\n📄 **[Descargar como Word]({docx_url})**\n"
+                    yield _sse_chunk(model, chat_id, footer)
+            except Exception as e:
+                logger.warning("Auto-DOCX fallo: %s", str(e)[:100])
 
         yield _sse_chunk(model, chat_id, "", finish_reason="stop")
         yield "data: [DONE]\n\n"
@@ -757,7 +769,7 @@ async def chat_completions(req: ChatCompletionsReq):
         }
 
     return StreamingResponse(
-        _stream_openai(messages, req.model, hits, active_model=active_model),
+        _stream_openai(messages, req.model, hits, active_model=active_model, intent=intent),
         media_type="text/event-stream",
     )
 
@@ -767,7 +779,7 @@ def root():
     return {"service": "mg-rag-gateway", "docs": "/docs"}
 
 
-# --------------------- DOWNLOAD DOCX (para Open WebUI Function) ---------------------
+# --------------------- DOWNLOAD DOCX ---------------------
 
 DOCX_DIR = Path("/tmp/mg_docx")
 DOCX_DIR.mkdir(exist_ok=True)
@@ -778,16 +790,12 @@ class DocxReq(BaseModel):
     filename: str = "escrito.docx"
 
 
-@app.post("/download/docx")
-def create_docx(req: DocxReq):
-    """Genera un .docx del texto y devuelve un ID para descargarlo despues."""
+def _text_to_docx(text: str, filepath: Path) -> None:
+    """Convierte markdown a .docx con formato legal argentino."""
     from docx import Document
     from docx.shared import Pt, Cm
     from docx.enum.text import WD_PARAGRAPH_ALIGNMENT
     import re as _re
-
-    if not req.text.strip():
-        raise HTTPException(400, "text vacio")
 
     doc = Document()
     style = doc.styles["Normal"]
@@ -799,7 +807,6 @@ def create_docx(req: DocxReq):
         section.left_margin = Cm(3.0)
         section.right_margin = Cm(2.0)
 
-    text = req.text.split("\n---\n⚠️")[0].strip()
     for raw_line in text.splitlines():
         line = raw_line.rstrip()
         if not line:
@@ -831,18 +838,38 @@ def create_docx(req: DocxReq):
             else:
                 p.add_run(part)
 
+    doc.save(filepath)
+
+
+def _generate_docx_link(text: str, filename: str = "escrito.docx") -> str:
+    """Genera .docx del texto y devuelve URL publica de descarga."""
+    text = (text or "").split("\n---\n⚠️")[0].split("\n---\n\n📄")[0].strip()
+    if not text:
+        return ""
     file_id = uuid.uuid4().hex
     filepath = DOCX_DIR / f"{file_id}.docx"
-    doc.save(filepath)
-    logger.info("DOCX generado: %s (%d bytes)", filepath, filepath.stat().st_size)
-
-    # Cleanup: borrar archivos con mas de 1 hora
-    import time as _t
-    now = _t.time()
+    _text_to_docx(text, filepath)
+    # Cleanup viejos (>1h)
+    now = time.time()
     for old in DOCX_DIR.glob("*.docx"):
         if now - old.stat().st_mtime > 3600:
             old.unlink(missing_ok=True)
+    return f"{PUBLIC_BASE_URL}/download/docx/{file_id}?filename={filename}"
 
+
+@app.post("/download/docx")
+def create_docx(req: DocxReq):
+    """Endpoint publico: genera DOCX y devuelve ID."""
+    if not req.text.strip():
+        raise HTTPException(400, "text vacio")
+    file_id = uuid.uuid4().hex
+    filepath = DOCX_DIR / f"{file_id}.docx"
+    _text_to_docx(req.text, filepath)
+    logger.info("DOCX generado: %s (%d bytes)", filepath, filepath.stat().st_size)
+    now = time.time()
+    for old in DOCX_DIR.glob("*.docx"):
+        if now - old.stat().st_mtime > 3600:
+            old.unlink(missing_ok=True)
     return {"id": file_id, "filename": req.filename}
 
 
