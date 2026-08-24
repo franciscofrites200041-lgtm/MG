@@ -137,11 +137,97 @@ def _process_and_upsert(tmp_file: Path, virtual_path: str, mtime: float, size: i
     return "ok"
 
 
+def _preflight() -> bool:
+    """Verifica que todo el pipeline este OK antes de una corrida real."""
+    print("=== PREFLIGHT ===")
+    all_ok = True
+
+    # 1. rclone binary
+    try:
+        r = subprocess.run(["rclone", "version"], capture_output=True, text=True, timeout=10)
+        if r.returncode == 0:
+            print(f"  [OK] rclone: {r.stdout.splitlines()[0]}")
+        else:
+            print(f"  [FAIL] rclone version -> rc={r.returncode}")
+            all_ok = False
+    except Exception as e:
+        print(f"  [FAIL] rclone no ejecuta: {e}")
+        return False
+
+    # 2. rclone config accesible
+    try:
+        r = subprocess.run(["rclone", "listremotes"], capture_output=True, text=True, timeout=10)
+        remotes = r.stdout.strip().splitlines()
+        if f"{REMOTE}:" in remotes:
+            print(f"  [OK] rclone config: remote '{REMOTE}' encontrado")
+        else:
+            print(f"  [FAIL] remote '{REMOTE}' no en {remotes}")
+            all_ok = False
+    except Exception as e:
+        print(f"  [FAIL] rclone listremotes: {e}")
+        all_ok = False
+
+    # 3. Acceso al NAS
+    remote_path = f"{REMOTE}:{SRC}"
+    try:
+        r = subprocess.run(["rclone", "lsd", remote_path, "--max-depth", "1"],
+                           capture_output=True, text=True, timeout=60)
+        if r.returncode == 0:
+            n_dirs = len(r.stdout.strip().splitlines())
+            print(f"  [OK] NAS accesible: {n_dirs} entradas top-level en {remote_path}")
+        else:
+            print(f"  [FAIL] NAS no accesible: {r.stderr[:200]}")
+            all_ok = False
+    except Exception as e:
+        print(f"  [FAIL] rclone lsd fallo: {e}")
+        all_ok = False
+
+    # 4. Qdrant responde
+    try:
+        from rag import qdrant_backend
+        info = qdrant_backend.stats()
+        if "error" not in info:
+            print(f"  [OK] Qdrant: {info.get('points', 0):,} puntos en '{info.get('collection')}'")
+        else:
+            print(f"  [FAIL] Qdrant error: {info['error']}")
+            all_ok = False
+    except Exception as e:
+        print(f"  [FAIL] Qdrant no responde: {e}")
+        all_ok = False
+
+    # 5. Embedder funciona
+    try:
+        from rag.reranker import embed_texts
+        v = embed_texts(["hola mundo"])
+        print(f"  [OK] Embedder: shape {v.shape}")
+    except Exception as e:
+        print(f"  [FAIL] Embedder: {e}")
+        all_ok = False
+
+    # 6. TMP writable
+    try:
+        TMP_DIR.mkdir(parents=True, exist_ok=True)
+        test_file = TMP_DIR / f".preflight_{uuid.uuid4().hex}"
+        test_file.write_bytes(b"ok")
+        test_file.unlink()
+        print(f"  [OK] TMP_DIR escribible: {TMP_DIR}")
+    except Exception as e:
+        print(f"  [FAIL] TMP_DIR {TMP_DIR}: {e}")
+        all_ok = False
+
+    print("=== PREFLIGHT %s ===" % ("OK" if all_ok else "FAIL"))
+    return all_ok
+
+
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--limit", type=int, default=None, help="Cortar tras N archivos (debug)")
     p.add_argument("--dry-run", action="store_true", help="Solo listar candidatos, no bajar")
+    p.add_argument("--preflight", action="store_true", help="Chequea rclone/NAS/Qdrant/embedder y sale")
     args = p.parse_args()
+
+    if args.preflight:
+        sys.exit(0 if _preflight() else 1)
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     for noisy in ("httpx", "httpcore", "urllib3"):
@@ -214,6 +300,21 @@ def main() -> None:
             logger.info("  [%d/%d] ok=%d err=%d", i, total, ok, err)
 
     logger.info("Fin: ok=%d err=%d de %d candidatos", ok, err, total)
+
+    # Guardar checkpoint del run para monitoreo
+    ckpt_path = Path("/data/logs/nas_ondemand_last.json")
+    try:
+        ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+        ckpt_path.write_text(json.dumps({
+            "timestamp": time.time(),
+            "listados": len(listing),
+            "chequeados": checked,
+            "candidatos": total,
+            "procesados_ok": ok,
+            "procesados_err": err,
+        }, indent=2))
+    except Exception as e:
+        logger.warning("no pude escribir checkpoint: %s", e)
 
 
 if __name__ == "__main__":
