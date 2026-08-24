@@ -1,17 +1,16 @@
-"""RAG Gateway: expone endpoint OpenAI-compatible que Open WebUI consume.
+"""RAG Gateway: expone endpoint OpenAI-compat que Open WebUI consume.
 
 Flujo por request:
     1. Recibe chat completions request (mensajes + config)
     2. Toma el ultimo user message = query
     3. Embed + Qdrant search -> top-k chunks
     4. Arma prompt: system (con contexto RAG) + historial (compactado si excede) + query
-    5. Llama Gemini con streaming
+    5. Llama OpenAI con streaming
     6. Devuelve chunks OpenAI-formatted al frontend
 
 Auto-compactacion:
     Si el total_tokens estimado del historial supera COMPACT_THRESHOLD,
-    los mensajes anteriores al ultimo turno se reemplazan por un resumen
-    (llamando a Gemini con prompt de resumen). Se guarda como system extra.
+    los mensajes anteriores al ultimo turno se reemplazan por un resumen.
 
 Endpoints:
     GET  /v1/models                    -> lista mock (Open WebUI necesita)
@@ -29,8 +28,8 @@ import uuid
 from pathlib import Path
 from typing import AsyncIterator
 
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -39,12 +38,13 @@ os.environ.setdefault("RAG_BACKEND", "qdrant")
 logger = logging.getLogger("gateway")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash-exp")
-GEMINI_SUMMARIZE_MODEL = os.getenv("GEMINI_SUMMARIZE_MODEL", "gemini-2.0-flash-exp")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_SUMMARIZE_MODEL = os.getenv("OPENAI_SUMMARIZE_MODEL", "gpt-4o-mini")
+OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "")  # vacio = default OpenAI
 QDRANT_TOP_K = int(os.getenv("QDRANT_TOP_K", "8"))
 COMPACT_THRESHOLD_TOKENS = int(os.getenv("COMPACT_THRESHOLD_TOKENS", "8000"))
-MODEL_NAME_EXPOSED = os.getenv("MODEL_NAME_EXPOSED", "mg-bot-gemini")
+MODEL_NAME_EXPOSED = os.getenv("MODEL_NAME_EXPOSED", "mg-bot")
 
 
 app = FastAPI(title="MG RAG Gateway", version="1.0")
@@ -66,25 +66,15 @@ class ChatCompletionsReq(BaseModel):
     max_tokens: int | None = None
 
 
-# --------------------- LLM CALL (Gemini) ---------------------
+# --------------------- LLM CALL (OpenAI) ---------------------
 
 
-def _gemini_client():
-    from google import genai  # google-genai package
-    return genai.Client(api_key=GEMINI_API_KEY)
-
-
-def _to_gemini_contents(messages: list[Message]) -> tuple[str | None, list[dict]]:
-    """Extrae system prompt y convierte al formato Gemini (role user/model)."""
-    system_prompt = None
-    contents = []
-    for m in messages:
-        if m.role == "system":
-            system_prompt = (system_prompt + "\n\n" + m.content) if system_prompt else m.content
-        else:
-            role = "user" if m.role == "user" else "model"
-            contents.append({"role": role, "parts": [{"text": m.content}]})
-    return system_prompt, contents
+def _openai_client():
+    from openai import OpenAI
+    kwargs = {"api_key": OPENAI_API_KEY}
+    if OPENAI_BASE_URL:
+        kwargs["base_url"] = OPENAI_BASE_URL
+    return OpenAI(**kwargs)
 
 
 def _count_tokens(text: str) -> int:
@@ -122,7 +112,7 @@ def _rag_context(query: str) -> tuple[str, list[dict]]:
 
 
 def _summarize(messages: list[Message]) -> str:
-    """Resume una lista de mensajes en 1-2 parrafos. Llamada sincrona a Gemini."""
+    """Resume una lista de mensajes en 1-2 parrafos. Llamada sincrona a OpenAI."""
     if not messages:
         return ""
     body = "\n\n".join(f"[{m.role}]: {m.content}" for m in messages)
@@ -130,31 +120,27 @@ def _summarize(messages: list[Message]) -> str:
               "(nombres, fechas, montos, decisiones tomadas). Zero relleno.\n\n"
               f"{body}\n\nResumen:")
     try:
-        client = _gemini_client()
-        r = client.models.generate_content(
-            model=GEMINI_SUMMARIZE_MODEL,
-            contents=[{"role": "user", "parts": [{"text": prompt}]}],
+        client = _openai_client()
+        r = client.chat.completions.create(
+            model=OPENAI_SUMMARIZE_MODEL,
+            messages=[{"role": "user", "content": prompt}],
         )
-        return (r.text or "").strip()
+        return (r.choices[0].message.content or "").strip()
     except Exception as e:
         logger.exception("Fallo summarize: %s", e)
         return "[Resumen no disponible por error interno.]"
 
 
 def _maybe_compact(messages: list[Message]) -> list[Message]:
-    """Si total_tokens > threshold, resume todos menos los ultimos 4 turnos.
-
-    Devuelve nueva lista: [system(s) originales, system_extra(resumen), ...ultimos_4].
-    """
+    """Si total_tokens > threshold, resume todos menos los ultimos 4 turnos."""
     total = _total_tokens(messages)
     if total <= COMPACT_THRESHOLD_TOKENS:
         return messages
 
-    # ponytail: separar por rol, no por indice, para no romper si vienen desordenados
     system_msgs = [m for m in messages if m.role == "system"]
     non_system = [m for m in messages if m.role != "system"]
     if len(non_system) <= 4:
-        return messages  # muy corto, no vale la pena
+        return messages
     to_summarize = non_system[:-4]
     tail = non_system[-4:]
     logger.info("Compactando %d mensajes (~%d tokens)", len(to_summarize), total)
@@ -184,27 +170,26 @@ def _sse_chunk(model: str, chat_id: str, delta_text: str, finish_reason: str | N
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
 
-async def _stream_gemini(messages: list[Message], model: str) -> AsyncIterator[str]:
-    from google import genai
-    from google.genai import types as gtypes
-    client = _gemini_client()
-    system_prompt, contents = _to_gemini_contents(messages)
-    config = gtypes.GenerateContentConfig(system_instruction=system_prompt) if system_prompt else None
+async def _stream_openai(messages: list[Message], model: str) -> AsyncIterator[str]:
+    client = _openai_client()
+    msgs_dict = [{"role": m.role, "content": m.content} for m in messages]
     chat_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
     try:
-        stream = client.models.generate_content_stream(
-            model=GEMINI_MODEL,
-            contents=contents,
-            config=config,
+        stream = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=msgs_dict,
+            stream=True,
         )
         for chunk in stream:
-            text = getattr(chunk, "text", "") or ""
+            if not chunk.choices:
+                continue
+            text = chunk.choices[0].delta.content or ""
             if text:
                 yield _sse_chunk(model, chat_id, text)
         yield _sse_chunk(model, chat_id, "", finish_reason="stop")
         yield "data: [DONE]\n\n"
     except Exception as e:
-        logger.exception("Stream Gemini fallo")
+        logger.exception("Stream OpenAI fallo")
         err_msg = f"\n\n[Error interno del gateway: {type(e).__name__}: {e}]"
         yield _sse_chunk(model, chat_id, err_msg, finish_reason="stop")
         yield "data: [DONE]\n\n"
@@ -228,8 +213,8 @@ def health():
         "status": "ok",
         "qdrant_ok": ok_qdrant,
         "qdrant_points": n_points,
-        "gemini_configured": bool(GEMINI_API_KEY),
-        "model": GEMINI_MODEL,
+        "openai_configured": bool(OPENAI_API_KEY),
+        "model": OPENAI_MODEL,
     }
 
 
@@ -249,24 +234,21 @@ def list_models():
 
 @app.post("/v1/chat/completions")
 async def chat_completions(req: ChatCompletionsReq):
-    if not GEMINI_API_KEY:
-        raise HTTPException(500, "GEMINI_API_KEY no configurada")
+    if not OPENAI_API_KEY:
+        raise HTTPException(500, "OPENAI_API_KEY no configurada")
     if not req.messages:
         raise HTTPException(400, "messages vacio")
 
-    # 1) ultimo user message -> query RAG
     last_user = next((m for m in reversed(req.messages) if m.role == "user"), None)
     if not last_user:
         raise HTTPException(400, "sin user message")
 
-    # 2) RAG context
     try:
         ctx_block, hits = _rag_context(last_user.content)
     except Exception as e:
         logger.exception("RAG fallo")
         ctx_block, hits = "", []
 
-    # 3) armar messages finales: system(RAG) + historial (compactado si excede)
     messages = list(req.messages)
     if ctx_block:
         messages = [Message(role="system", content=ctx_block)] + messages
@@ -276,13 +258,10 @@ async def chat_completions(req: ChatCompletionsReq):
                 len(hits), _total_tokens(messages), req.stream)
 
     if not req.stream:
-        # Modo no-streaming: coleccionar todo y devolver
-        from google.genai import types as gtypes
-        client = _gemini_client()
-        system_prompt, contents = _to_gemini_contents(messages)
-        config = gtypes.GenerateContentConfig(system_instruction=system_prompt) if system_prompt else None
-        r = client.models.generate_content(model=GEMINI_MODEL, contents=contents, config=config)
-        text = r.text or ""
+        client = _openai_client()
+        msgs_dict = [{"role": m.role, "content": m.content} for m in messages]
+        r = client.chat.completions.create(model=OPENAI_MODEL, messages=msgs_dict)
+        text = r.choices[0].message.content or ""
         return {
             "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
             "object": "chat.completion",
@@ -296,7 +275,7 @@ async def chat_completions(req: ChatCompletionsReq):
         }
 
     return StreamingResponse(
-        _stream_gemini(messages, req.model),
+        _stream_openai(messages, req.model),
         media_type="text/event-stream",
     )
 

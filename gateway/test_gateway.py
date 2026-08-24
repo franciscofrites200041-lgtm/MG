@@ -1,9 +1,8 @@
-"""Self-check estructural del gateway sin Gemini real.
+"""Self-check estructural del gateway sin OpenAI real.
 
 Valida:
     - Compactacion dispara al pasar el threshold
     - Formato SSE chunk es OpenAI-compat
-    - _to_gemini_contents parsea correcto
     - RAG search contra Qdrant real trae hits (si Qdrant esta corriendo con datos)
 
 Uso:
@@ -18,7 +17,7 @@ from pathlib import Path
 os.environ.setdefault("QDRANT_URL", "http://127.0.0.1:6333")
 os.environ.setdefault("QDRANT_COLLECTION", "mg_docs")
 os.environ.setdefault("COMPACT_THRESHOLD_TOKENS", "100")  # bajo para test
-os.environ.setdefault("GEMINI_API_KEY", "test-key-dummy")  # solo para que arranque
+os.environ.setdefault("OPENAI_API_KEY", "test-key-dummy")  # solo para que arranque
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -42,25 +41,8 @@ def test_total_tokens():
 def test_compact_no_dispara_si_corto():
     msgs = [Message(role="user", content="hola")]
     out = gw._maybe_compact(msgs)
-    assert out == msgs, "no deberia compactar mensajes cortos"
+    assert out == msgs
     print("[OK] compact no dispara con mensajes cortos")
-
-
-def test_to_gemini_contents_extrae_system():
-    msgs = [
-        Message(role="system", content="sos legal"),
-        Message(role="system", content="responde en espanol"),
-        Message(role="user", content="que es un contrato?"),
-        Message(role="assistant", content="es un acuerdo..."),
-        Message(role="user", content="dame ejemplos"),
-    ]
-    sys_p, contents = gw._to_gemini_contents(msgs)
-    assert sys_p == "sos legal\n\nresponde en espanol", sys_p
-    assert len(contents) == 3, len(contents)
-    assert contents[0]["role"] == "user"
-    assert contents[1]["role"] == "model"
-    assert contents[2]["role"] == "user"
-    print("[OK] _to_gemini_contents parsea system+historial")
 
 
 def test_sse_chunk_shape():
@@ -96,12 +78,9 @@ def test_rag_search_qdrant_real():
             return
         assert "## Contexto" in ctx
         h0 = hits[0]
-        assert "path" in h0
-        assert "filename" in h0
-        assert "page" in h0
-        assert "snippet" in h0
+        for k in ("path", "filename", "page", "snippet"):
+            assert k in h0, k
         print(f"[OK] RAG search real: {len(hits)} hits, top score={h0.get('score', 0):.3f}")
-        print(f"     top filename: {h0['filename']}")
     except Exception as e:
         print(f"[FAIL] RAG search real: {type(e).__name__}: {e}")
 
@@ -110,7 +89,6 @@ if __name__ == "__main__":
     test_token_estimation()
     test_total_tokens()
     test_compact_no_dispara_si_corto()
-    test_to_gemini_contents_extrae_system()
     test_sse_chunk_shape()
     test_sse_chunk_final()
     test_rag_search_qdrant_real()
