@@ -388,7 +388,9 @@ def exists_by_path_mtime(path: str, mtime: float) -> bool:
         FieldCondition(key="path", match=MatchValue(value=path)),
         FieldCondition(key="mtime", range=Range(gte=mtime - 0.001, lte=mtime + 0.001)),
     ])
-    result = c.count(collection_name=COLLECTION, count_filter=q_filter, exact=False)
+    # exact=True: sin esto, Qdrant devuelve una estimacion que puede reportar >0
+    # cuando en realidad son 0 hits -> marca archivos como ya indexados y los saltea.
+    result = c.count(collection_name=COLLECTION, count_filter=q_filter, exact=True)
     return result.count > 0
 
 
