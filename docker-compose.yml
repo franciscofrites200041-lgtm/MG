@@ -37,9 +37,10 @@ services:
     volumes:
       - hf_cache:/root/.cache/huggingface
       - /data:/data
-      # rclone config + SSH key del host (para on-demand NAS access via Tailscale)
+      # rclone config + SSH key del host (misma ruta absoluta para que rclone.conf
+      # con 'key_file = /home/mg/.ssh/nas_sftp' funcione sin editar)
       - /home/mg/.config/rclone:/root/.config/rclone:ro
-      - /home/mg/.ssh:/root/.ssh:ro
+      - /home/mg/.ssh:/home/mg/.ssh:ro
     environment:
       RAG_BACKEND: qdrant
       QDRANT_URL: http://qdrant:6333
