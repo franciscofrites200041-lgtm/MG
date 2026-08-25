@@ -173,16 +173,17 @@ def _preflight() -> bool:
     # 3. Acceso al NAS
     remote_path = f"{REMOTE}:{NAS_SHARE_PATH}"
     try:
-        r = subprocess.run(["rclone", "lsd", remote_path, "--max-depth", "1"],
+        # ponytail: 'lsf' lista archivos+dirs (lsd solo dirs, falla si el share tiene solo files en top)
+        r = subprocess.run(["rclone", "lsf", remote_path, "--max-depth", "1"],
                            capture_output=True, text=True, timeout=60)
         if r.returncode == 0:
-            n_dirs = len(r.stdout.strip().splitlines())
-            print(f"  [OK] NAS accesible: {n_dirs} entradas top-level en {remote_path}")
+            n_entries = len(r.stdout.strip().splitlines())
+            print(f"  [OK] NAS accesible: {n_entries} entradas top-level en {remote_path}")
         else:
             print(f"  [FAIL] NAS no accesible: {r.stderr[:200]}")
             all_ok = False
     except Exception as e:
-        print(f"  [FAIL] rclone lsd fallo: {e}")
+        print(f"  [FAIL] rclone lsf fallo: {e}")
         all_ok = False
 
     # 4. Qdrant responde
