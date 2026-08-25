@@ -13,10 +13,14 @@ concatenando chunks por (path, page) ordenados por chunk_idx.
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
 import sqlite3
+import time
+import unicodedata
+from pathlib import Path
 
 logger = logging.getLogger("rag.search")
 
@@ -26,6 +30,7 @@ NAS_ROOT = os.getenv("NAS_ROOT", "")
 RERANK_POOL = int(os.getenv("RERANK_POOL", "20"))
 QDRANT_SEARCH_LIMIT = int(os.getenv("QDRANT_SEARCH_LIMIT", "20"))
 MAX_PROMOTIONS_PER_QUERY = int(os.getenv("MAX_PROMOTIONS_PER_QUERY", "5"))
+NO_HIT_LOG = os.getenv("NO_HIT_LOG", "/data/logs/queries_no_hit.jsonl")
 
 _TOKEN_RE = re.compile(r"[A-Za-zÁÉÍÓÚÜÑáéíóúüñ0-9]{2,}")
 
@@ -35,45 +40,162 @@ def _sanitize_query(q: str) -> str:
     return " ".join(tokens)
 
 
+def _normalize_for_citation(s: str) -> str:
+    """Lowercase + strip acentos + collapse spaces. Uso para comparar filenames tolerante."""
+    if not s:
+        return ""
+    nfkd = unicodedata.normalize("NFKD", s)
+    ascii_str = "".join(c for c in nfkd if not unicodedata.combining(c))
+    return re.sub(r"\s+", " ", ascii_str.lower().strip())
+
+
+def citation_matches(cited_filename: str, context_paths: list[str]) -> bool:
+    """True si el filename citado matchea (normalizado) algun path del contexto.
+
+    Uso desde el verificador de citas del pipeline superior. Tolera mayusculas,
+    acentos, y espacios extra.
+    """
+    cited_norm = _normalize_for_citation(cited_filename)
+    if not cited_norm:
+        return False
+    for p in context_paths:
+        pname = _normalize_for_citation(Path(p).name)
+        if cited_norm == pname or cited_norm in pname or pname in cited_norm:
+            return True
+    return False
+
+
+def _log_no_hit(query: str, analyzed, sugerencias: list[dict]) -> None:
+    """Persiste queries fallidas para poder skillificarlas como evals despues."""
+    try:
+        line = json.dumps({
+            "ts": time.time(),
+            "query": query[:500],
+            "carpeta": analyzed.carpeta,
+            "expedientes": analyzed.expedientes,
+            "nombres": analyzed.nombres_propios,
+            "intent": analyzed.intent,
+            "sugerencias": [s.get("path") for s in sugerencias[:5]],
+        }, ensure_ascii=False)
+        p = Path(NO_HIT_LOG)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with p.open("a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception as e:
+        logger.debug("no_hit log fallo: %s", e)
+
+
 # =============== QDRANT PATH ===============
 
-def _buscar_qdrant(query: str, top_k: int) -> str:
-    """Semantic search puro sobre Qdrant + rerank opcional sobre top-N."""
-    from rag import qdrant_backend, reranker
+def _buscar_qdrant(query: str, top_k: int, prev_context=None) -> str:
+    """Hybrid search sobre Qdrant: semantic + filename MatchText + path MatchText.
 
+    Flujo:
+    1. analyze_query -> extrae carpeta, expedientes, nombres, intent, negaciones
+    2. hybrid retrieval combinando 3 canales
+    3. Si intent='caso', reordena filenames que parecen expedientes primero
+    4. Si zero hits, fallback: sugerencias por filename similarity
+    """
+    from rag import qdrant_backend, reranker
+    from rag.query_analyzer import analyze_query
+
+    # 1. Analisis. Enriquecido con carpetas conocidas para fuzzy match.
     try:
-        qvec = reranker.embed_query(query).tolist()
+        carpetas = qdrant_backend.list_carpetas_top()
+    except Exception as e:
+        logger.warning("list_carpetas_top fallo, sigo sin fuzzy: %s", e)
+        carpetas = []
+    analyzed = analyze_query(query, carpetas_conocidas=carpetas, prev_context=prev_context)
+
+    # 2. Embedding sobre texto limpio (sin numeros de expte, sin scope)
+    try:
+        qvec = reranker.embed_query(analyzed.text_semantic or query).tolist()
     except Exception as e:
         logger.exception("No pude embeddear query: %s", e)
         return f"Error del reranker: {e}"
 
     pool = max(top_k, QDRANT_SEARCH_LIMIT)
+
+    # Filename terms: nombres propios + expedientes (los mas discriminativos)
+    filename_terms = list(analyzed.nombres_propios) + list(analyzed.expedientes)
+
     try:
-        hits = qdrant_backend.search(qvec, limit=pool)
+        hits = qdrant_backend.search_hybrid(
+            qvec, limit=pool,
+            carpeta=analyzed.carpeta,
+            filename_terms=filename_terms,
+            expedientes=analyzed.expedientes,
+        )
     except Exception as e:
-        logger.exception("Qdrant search fallo: %s", e)
+        logger.exception("Qdrant search_hybrid fallo: %s", e)
         return f"Error del index Qdrant: {e}"
 
-    if not hits:
-        return "Sin resultados."
+    # 3. Intent-aware reorder: si el user pidio "casos", priorizar filenames tipo expediente
+    if analyzed.intent == "caso":
+        hits = _reorder_by_caso_signal(hits)
 
-    # ponytail: Qdrant ya devuelve por cosine, el rerank explicito con MiniLM sobre
-    # el mismo modelo seria redundante. Se deja hook por si mas adelante se usa un
-    # cross-encoder pesado (bge-reranker) que si aporta calidad extra al reordenar.
+    # 4. Optional cross-encoder
     if reranker.is_enabled() and os.getenv("RERANK_CROSS_ENCODER") == "1":
         try:
-            hits = _cross_encoder_rerank(query, hits)
+            hits = _cross_encoder_rerank(analyzed.text, hits)
         except Exception as e:
             logger.warning("cross-encoder rerank fallo, cae a orden Qdrant: %s", e)
 
     hits = hits[:top_k]
 
+    if not hits:
+        # 5. Fallback: sugerir archivos por filename similarity
+        sugerencias = []
+        if filename_terms:
+            try:
+                sugerencias = qdrant_backend.search_filenames_similar(filename_terms, limit=3)
+            except Exception as e:
+                logger.warning("filename similar fallo: %s", e)
+        _log_no_hit(query, analyzed, sugerencias)
+        if sugerencias:
+            lines = ["Sin resultados directos. Archivos con nombre parecido:"]
+            for i, s in enumerate(sugerencias, 1):
+                lines.append(f"[{i}] {s.get('filename', '?')}\n    path: {s.get('path')}")
+            if analyzed.carpeta:
+                lines.append(f"(scope aplicado: carpeta '{analyzed.carpeta}')")
+            return "\n".join(lines)
+        return "Sin resultados." + (
+            f" (scope: carpeta '{analyzed.carpeta}')" if analyzed.carpeta else ""
+        )
+
     lines = []
     for i, h in enumerate(hits, start=1):
         marker = f" (pag. {h.get('page', '?')})"
         snippet = (h.get("snippet") or "")[:300]
-        lines.append(f"[{i}] {h.get('filename', '?')}{marker} - {snippet}\n    path: {h.get('path')}")
+        canal = h.get("_channel", "")
+        canal_hint = f" [{canal}]" if canal and canal != "semantic" else ""
+        lines.append(
+            f"[{i}] {h.get('filename', '?')}{marker}{canal_hint} - {snippet}\n"
+            f"    path: {h.get('path')}"
+        )
     return "\n".join(lines)
+
+
+_RE_EXPTE_EN_FILENAME = re.compile(
+    r"(?:N[°º]?\.?\s*\d|Expte|Exp\.|FMZ|\d{5,})|(?:\bc/\b)|(?:\bvs?\b)",
+    re.IGNORECASE,
+)
+
+
+def _reorder_by_caso_signal(hits: list[dict]) -> list[dict]:
+    """Cuando intent='caso', promueve hits cuyo filename parece un expediente concreto
+    (contiene N°, Expte, apellidos c/ demandado, etc). Mantiene el orden relativo dentro
+    de cada grupo.
+    """
+    con_signal = []
+    sin_signal = []
+    for h in hits:
+        fn = h.get("filename", "") or ""
+        if _RE_EXPTE_EN_FILENAME.search(fn):
+            con_signal.append(h)
+        else:
+            sin_signal.append(h)
+    return con_signal + sin_signal
 
 
 def _cross_encoder_rerank(query: str, hits: list[dict]) -> list[dict]:
@@ -284,19 +406,35 @@ def _stats_sqlite() -> dict:
 
 # =============== API PUBLICA (dispatch) ===============
 
-def buscar_en_documentos(query: str, top_k: int = 5) -> str:
-    """Busca en la base interna del estudio (RAG). Devuelve los N chunks mas relevantes con path y pagina.
+def buscar_en_documentos(query: str, top_k: int = 5, prev_context: dict | None = None) -> str:
+    """Busca en la base interna del estudio (RAG) con hybrid retrieval.
 
     Usa esta tool ANTES de responder cualquier pregunta sobre polizas, contratos, expedientes,
     fallos internos o cualquier documento propio del estudio Montoya-Gherzi.
 
+    La query se analiza para extraer automaticamente: nombre de carpeta ('en la carpeta X'),
+    numeros de expediente ('N° 12345', 'FMZ 25156/2024'), nombres propios en mayusculas
+    (BENAVIDEZ), e intencion (caso vs concepto). Estos se aplican como filtros/boost
+    ademas del semantic search.
+
     Args:
-        query: Palabras clave o pregunta en lenguaje natural.
+        query: Palabras clave o pregunta en lenguaje natural. Si conoces la carpeta o
+            numero de expediente, mencionalos explicitos ('carpeta ARABELA', 'N° 170495').
         top_k: Cantidad de resultados (default 5, max 10).
+        prev_context: opcional. Dict con {carpeta, expedientes, nombres_propios} del
+            turno anterior para heredar en follow-ups ('y el segundo?', 'ampliá').
     """
     top_k = max(1, min(top_k, 10))
+    ctx = None
+    if prev_context:
+        from rag.query_analyzer import QueryContext
+        ctx = QueryContext(
+            carpeta=prev_context.get("carpeta"),
+            expedientes=list(prev_context.get("expedientes") or []),
+            nombres_propios=list(prev_context.get("nombres_propios") or []),
+        )
     if RAG_BACKEND == "qdrant":
-        return _buscar_qdrant(query, top_k)
+        return _buscar_qdrant(query, top_k, prev_context=ctx)
     return _buscar_sqlite(query, top_k)
 
 
