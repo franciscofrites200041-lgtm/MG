@@ -34,7 +34,10 @@ os.environ.setdefault("RAG_BACKEND", "qdrant")
 logger = logging.getLogger("nas_ondemand")
 
 REMOTE = os.getenv("RCLONE_REMOTE", "nas")
-SRC = os.getenv("RCLONE_SOURCE_PATH", "Publico")
+# NAS_SHARE_PATH: lo que va despues de "nas:" en rclone (SFTP chroot al home user).
+# SIN /volume1/... porque el SFTP chroot no lo tiene, solo ve los shares.
+NAS_SHARE_PATH = os.getenv("NAS_SHARE_PATH", "Publico")
+# VIRTUAL_ROOT: prefix que se guarda en Qdrant (compatible con los 544k puntos ya cargados).
 VIRTUAL_ROOT = os.getenv("VIRTUAL_ROOT", "/volume1/Publico/Estudio")
 TMP_DIR = Path(os.getenv("TMP_DIR", "/tmp/nas_ondemand"))
 EXCLUDE_PREFIXES = ("Publico.zip", "#recycle/", "#snapshot/", "@eaDir/", ".DS_Store", "Thumbs.db")
@@ -168,7 +171,7 @@ def _preflight() -> bool:
         all_ok = False
 
     # 3. Acceso al NAS
-    remote_path = f"{REMOTE}:{SRC}"
+    remote_path = f"{REMOTE}:{NAS_SHARE_PATH}"
     try:
         r = subprocess.run(["rclone", "lsd", remote_path, "--max-depth", "1"],
                            capture_output=True, text=True, timeout=60)
@@ -236,7 +239,7 @@ def main() -> None:
     TMP_DIR.mkdir(parents=True, exist_ok=True)
 
     # 1. Listar NAS
-    remote_path = f"{REMOTE}:{SRC}"
+    remote_path = f"{REMOTE}:{NAS_SHARE_PATH}"
     try:
         listing = _rclone_list(remote_path)
     except Exception as e:
