@@ -173,6 +173,22 @@ def _is_escrito_request(query: str) -> bool:
 app = FastAPI(title="MG RAG Gateway", version="2.0")
 
 
+@app.on_event("startup")
+def _ensure_qdrant_indices() -> None:
+    """Al arrancar, garantiza que Qdrant tenga los payload indexes necesarios
+    (path TEXT + KEYWORD, filename TEXT, carpeta_top KEYWORD, etc). Idempotente.
+    """
+    if os.getenv("RAG_BACKEND", "qdrant").lower() != "qdrant":
+        return
+    try:
+        from rag import qdrant_backend
+        qdrant_backend.ensure_collection()
+    except Exception as e:
+        # No abortar el startup si Qdrant no esta arriba; el bot degrada pero levanta.
+        import logging
+        logging.getLogger("gateway").warning("ensure_collection en startup fallo: %s", e)
+
+
 class Message(BaseModel):
     role: str
     content: str
