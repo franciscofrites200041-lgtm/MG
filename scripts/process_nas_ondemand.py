@@ -45,22 +45,39 @@ CHUNK_TIMEOUT = int(os.getenv("RCLONE_CHUNK_TIMEOUT", "1800"))
 EXCLUDE_PREFIXES = ("Publico.zip", "#recycle/", "#snapshot/", "@eaDir/", ".DS_Store", "Thumbs.db")
 SUPPORTED_EXT = {".pdf", ".docx", ".doc", ".txt"}
 
+# Patrones para rclone --exclude: cortan en el listado, no despues.
+# Se aplican tanto al listado de dirs top-level como al lsjson recursivo.
+RCLONE_EXCLUDES = [
+    "#recycle/**", "#snapshot/**", "@eaDir/**",
+    ".DS_Store", "Thumbs.db", "~$*",
+    "Publico.zip",
+]
+
+
+def _exclude_args() -> list[str]:
+    args: list[str] = []
+    for pat in RCLONE_EXCLUDES:
+        args.extend(["--exclude", pat])
+    return args
+
 
 def _rclone_list(remote_path: str) -> Iterator[dict]:
-    """Stream por top-level dir. Timeout por chunk, no global."""
-    logger.info("rclone lsf top-level dirs %s...", remote_path)
+    """Stream por top-level dir. Timeout por chunk, no global. Excluye basura ANTES del listado."""
+    excludes = _exclude_args()
+
+    logger.info("rclone lsf top-level dirs %s (con excludes)...", remote_path)
     r = subprocess.run(
-        ["rclone", "lsf", remote_path, "--max-depth", "1", "--dirs-only"],
+        ["rclone", "lsf", remote_path, "--max-depth", "1", "--dirs-only", *excludes],
         capture_output=True, text=True, timeout=180,
     )
     if r.returncode != 0:
         raise RuntimeError(f"rclone lsf dirs fallo: {r.stderr[:500]}")
     dirs = [d.rstrip("/") for d in r.stdout.strip().splitlines() if d.strip()]
-    logger.info("  %d dirs top-level", len(dirs))
+    logger.info("  %d dirs top-level (excluidos: #recycle, #snapshot, @eaDir)", len(dirs))
 
     try:
         r = subprocess.run(
-            ["rclone", "lsjson", remote_path, "--files-only", "--max-depth", "1"],
+            ["rclone", "lsjson", remote_path, "--files-only", "--max-depth", "1", *excludes],
             capture_output=True, text=True, timeout=CHUNK_TIMEOUT,
         )
         if r.returncode == 0 and r.stdout.strip():
@@ -77,7 +94,8 @@ def _rclone_list(remote_path: str) -> Iterator[dict]:
         t0 = time.time()
         try:
             r = subprocess.run(
-                ["rclone", "lsjson", subpath, "--recursive", "--files-only", "--fast-list"],
+                ["rclone", "lsjson", subpath, "--recursive", "--files-only",
+                 "--fast-list", *excludes],
                 capture_output=True, text=True, timeout=CHUNK_TIMEOUT,
             )
         except subprocess.TimeoutExpired:
