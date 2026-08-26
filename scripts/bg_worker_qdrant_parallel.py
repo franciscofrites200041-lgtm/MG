@@ -194,7 +194,9 @@ def main() -> None:
     os.environ["QDRANT_URL"] = args.qdrant_url
     os.environ["QDRANT_COLLECTION"] = args.collection
     from rag import qdrant_backend
-    qdrant_backend.ensure_collection()
+    # ponytail: no llamamos ensure_collection() aca. El gateway ya lo hace al startup
+    # y sobre 556k puntos la creacion de indices puede tardar minutos, especialmente
+    # via SSH tunnel. Idempotente igual, si algo falta arriba se crea al proximo restart.
 
     source_root = str(Path(args.source_root).resolve())
     cp_path = Path(args.checkpoint)
