@@ -69,7 +69,15 @@ services:
       # Desactivar features no necesarias
       ENABLE_OLLAMA_API: "false"
       ENABLE_IMAGE_GENERATION: "false"
-      ENABLE_WEB_SEARCH: "false"
+      # Web search: DuckDuckGo no requiere API key. Para cambiar de engine
+      # (google_pse, tavily, brave, serper, serply, jina, searxng, etc.), ver
+      # README seccion "Web search en Open WebUI".
+      ENABLE_WEB_SEARCH: "true"
+      WEB_SEARCH_ENGINE: "${WEB_SEARCH_ENGINE:-duckduckgo}"
+      WEB_SEARCH_RESULT_COUNT: "${WEB_SEARCH_RESULT_COUNT:-5}"
+      WEB_SEARCH_CONCURRENT_REQUESTS: "${WEB_SEARCH_CONCURRENT_REQUESTS:-10}"
+      # Habilita el toggle del icono globo en el chat (usuario opta in/out por mensaje)
+      ENABLE_RAG_WEB_SEARCH: "true"
     ports:
       - "127.0.0.1:3000:8080"
 

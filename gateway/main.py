@@ -17,14 +17,17 @@ Endpoints:
 """
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import os
+import re
 import sys
 import time
 import uuid
 from pathlib import Path
-from typing import AsyncIterator
+from typing import Any, AsyncIterator
+from urllib.parse import urlsplit
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse, FileResponse
@@ -52,6 +55,28 @@ ENABLE_CROSS_ENCODER = os.getenv("ENABLE_CROSS_ENCODER", "1") not in ("0", "fals
 CROSS_ENCODER_MODEL = os.getenv("CROSS_ENCODER_MODEL", "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1")
 MODEL_NAME_EXPOSED = os.getenv("MODEL_NAME_EXPOSED", "mg-bot")
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "https://bot-estudio.montoya-gherzi.com.ar")
+
+# Reasoning effort para modelos de razonamiento (gpt-5*, o1*, o3*, o4*).
+# Valores validos OpenAI: "minimal" | "low" | "medium" | "high". Vacio = no lo mandamos.
+# En modelos NO-reasoning (gpt-4o, gpt-4.1, etc) OpenAI rechaza el parametro,
+# asi que solo se agrega si el nombre matchea un prefijo de reasoning.
+OPENAI_REASONING_EFFORT = os.getenv("OPENAI_REASONING_EFFORT", "").strip().lower()
+OPENAI_TEMPERATURE = float(os.getenv("OPENAI_TEMPERATURE", "0.1"))
+_REASONING_PREFIXES = ("gpt-5", "o1", "o3", "o4")
+
+
+def _is_reasoning_model(name: str) -> bool:
+    n = (name or "").lower()
+    return any(n.startswith(p) for p in _REASONING_PREFIXES)
+
+
+def _completion_extra(model: str) -> dict:
+    """Kwargs extra por modelo. Reasoning: reasoning_effort + sin temperature.
+    Non-reasoning: temperature configurable.
+    """
+    if _is_reasoning_model(model):
+        return {"reasoning_effort": OPENAI_REASONING_EFFORT} if OPENAI_REASONING_EFFORT else {}
+    return {"temperature": OPENAI_TEMPERATURE}
 
 _TRIVIAL_PATTERNS = {"hola", "buenas", "buen dia", "buenos dias", "buenas tardes",
                      "buenas noches", "gracias", "muchas gracias", "chau", "adios",
@@ -199,7 +224,73 @@ def _ensure_qdrant_indices() -> None:
 
 class Message(BaseModel):
     role: str
-    content: str
+    content: str | list[dict[str, Any]]
+
+
+def _content_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    return "\n".join(p["text"] for p in content if isinstance(p, dict) and p.get("type") == "text" and isinstance(p.get("text"), str) and p["text"])
+
+
+def _is_valid_image_url(url: Any) -> bool:
+    """Allow remote HTTP(S) images and valid OpenAI-compatible image data URLs only."""
+    if not isinstance(url, str) or not url:
+        return False
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return False
+    if parsed.scheme in ("https", "http"):
+        return bool(parsed.hostname)
+
+    match = re.fullmatch(
+        r"data:image/(avif|gif|jpe?g|png|webp);base64,([A-Za-z0-9+/]+={0,2})",
+        url,
+        re.IGNORECASE,
+    )
+    if not match:
+        return False
+    try:
+        data = base64.b64decode(match.group(2), validate=True)
+    except ValueError:
+        return False
+    if not data:
+        return False
+
+    image_type = match.group(1).lower()
+    signatures = {
+        "png": data.startswith(b"\x89PNG\r\n\x1a\n"),
+        "jpeg": data.startswith(b"\xff\xd8\xff"),
+        "jpg": data.startswith(b"\xff\xd8\xff"),
+        "gif": data.startswith((b"GIF87a", b"GIF89a")),
+        "webp": len(data) >= 12 and data.startswith(b"RIFF") and data[8:12] == b"WEBP",
+        "avif": len(data) >= 12 and data[4:8] == b"ftyp" and data[8:12] in (b"avif", b"avis"),
+    }
+    return signatures[image_type]
+
+
+def _forward_content(content: Any) -> Any:
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    safe = []
+    for p in content:
+        if not isinstance(p, dict):
+            continue
+        if p.get("type") == "text" and isinstance(p.get("text"), str):
+            safe.append({"type": "text", "text": p["text"]})
+        elif p.get("type") == "image_url" and isinstance(p.get("image_url"), dict):
+            image = p["image_url"]
+            if _is_valid_image_url(image.get("url")):
+                image_part = {"url": image["url"]}
+                if image.get("detail") in ("auto", "low", "high"):
+                    image_part["detail"] = image["detail"]
+                safe.append({"type": "image_url", "image_url": image_part})
+    return safe if safe else ""
 
 
 class ChatCompletionsReq(BaseModel):
@@ -221,12 +312,12 @@ def _openai_client():
     return OpenAI(**kwargs)
 
 
-def _count_tokens(text: str) -> int:
-    return max(1, len(text) // 4)
+def _count_tokens(text: Any) -> int:
+    return max(1, len(_content_text(text)) // 4)
 
 
 def _total_tokens(messages: list[Message]) -> int:
-    return sum(_count_tokens(m.content) for m in messages)
+    return sum(_count_tokens(_content_text(m.content)) for m in messages)
 
 
 # --------------------- QUERY UTILS ---------------------
@@ -278,8 +369,8 @@ def _expand_query(query: str) -> list[str]:
         r = client.chat.completions.create(
             model=OPENAI_QUERY_MODEL,
             messages=[{"role": "user", "content": prompt}],
-            temperature=0.3,
             max_tokens=200,
+            **_completion_extra(OPENAI_QUERY_MODEL),
         )
         text = (r.choices[0].message.content or "").strip()
         variants = [ln.strip("-•* ").strip() for ln in text.splitlines() if ln.strip()]
@@ -501,7 +592,7 @@ def _rag_context(query: str) -> tuple[str, list[dict]]:
 def _summarize(messages: list[Message]) -> str:
     if not messages:
         return ""
-    body = "\n\n".join(f"[{m.role}]: {m.content}" for m in messages)
+    body = "\n\n".join(f"[{m.role}]: {_content_text(m.content)}" for m in messages)
     prompt = ("Resumi esta conversacion legal en 1-2 parrafos claros, preservando datos concretos "
               "(nombres de partes, expedientes, fechas, montos, articulos citados, decisiones tomadas). "
               "Zero relleno.\n\n"
@@ -511,6 +602,7 @@ def _summarize(messages: list[Message]) -> str:
         r = client.chat.completions.create(
             model=OPENAI_SUMMARIZE_MODEL,
             messages=[{"role": "user", "content": prompt}],
+            **_completion_extra(OPENAI_SUMMARIZE_MODEL),
         )
         return (r.choices[0].message.content or "").strip()
     except Exception as e:
@@ -558,7 +650,7 @@ def _sse_chunk(model: str, chat_id: str, delta_text: str, finish_reason: str | N
 async def _stream_openai(messages: list[Message], model: str, hits: list[dict], active_model: str = None, intent: str = "consulta") -> AsyncIterator[str]:
     """Stream la respuesta y al final valida las citas contra los hits reales."""
     client = _openai_client()
-    msgs_dict = [{"role": m.role, "content": m.content} for m in messages]
+    msgs_dict = [{"role": m.role, "content": _forward_content(m.content)} for m in messages]
     chat_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
     buffered = []
     llm_model = active_model or OPENAI_MODEL
@@ -567,7 +659,7 @@ async def _stream_openai(messages: list[Message], model: str, hits: list[dict], 
             model=llm_model,
             messages=msgs_dict,
             stream=True,
-            temperature=0.1,
+            **_completion_extra(llm_model),
         )
         for chunk in stream:
             if not chunk.choices:
@@ -716,19 +808,26 @@ async def chat_completions(req: ChatCompletionsReq):
     if not last_user:
         raise HTTPException(400, "sin user message")
 
-    intent = "consulta"
-    if _is_trivial(last_user.content):
-        intent = "trivial"
-        logger.info("Query trivial, skip RAG: %r", last_user.content)
-        ctx_block, hits = "", []
-    else:
-        if _is_escrito_request(last_user.content):
+    query_text = _content_text(last_user.content).strip()
+    forwarded_last = _forward_content(last_user.content)
+    has_image = isinstance(forwarded_last, list) and any(part["type"] == "image_url" for part in forwarded_last)
+    if not query_text and not has_image:
+        raise HTTPException(400, "El mensaje no contiene texto ni una imagen image_url válida; los adjuntos no son procesables.")
+
+    is_text_trivial = bool(query_text) and _is_trivial(query_text)
+    intent = "trivial" if is_text_trivial and not has_image else "consulta"
+    ctx_block, hits = "", []
+    if intent == "trivial":
+        logger.info("Query trivial, skip RAG: %r", query_text)
+    elif query_text:
+        if _is_escrito_request(query_text):
             intent = "escrito"
-        try:
-            ctx_block, hits = _rag_context(last_user.content)
-        except Exception as e:
-            logger.exception("RAG fallo")
-            ctx_block, hits = "", []
+        if not is_text_trivial:
+            try:
+                ctx_block, hits = _rag_context(query_text)
+            except Exception as e:
+                logger.exception("RAG fallo")
+                ctx_block, hits = "", []
     logger.info("Intent detectado: %s", intent)
 
     # ponytail: para triviales usar modelo rapido + prompt minimo
@@ -765,9 +864,10 @@ async def chat_completions(req: ChatCompletionsReq):
 
     if not req.stream:
         client = _openai_client()
-        msgs_dict = [{"role": m.role, "content": m.content} for m in messages]
+        msgs_dict = [{"role": m.role, "content": _forward_content(m.content)} for m in messages]
         r = client.chat.completions.create(
-            model=active_model, messages=msgs_dict, temperature=0.1,
+            model=active_model, messages=msgs_dict,
+            **_completion_extra(active_model),
         )
         text = r.choices[0].message.content or ""
         # Validar citas
